@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "package_id": "sayu_loader",
+  "package_version": "0.2.0",
+  "contract_version": "2.0",
+  "author": "yomihime",
+  "license": "AGPL-3.0-only",
+  "source": "https://github.com/yomihime/astrbot_plugin_yomihime_game_link_sayu_loader_dlc",
+  "modules": [
+    {
+      "module_id": "sayusr",
+      "route": "sayusr",
+      "category": "game",
+      "factory_entry": "sayu.module:StarRailFactory",
+      "module_version": "0.2.0",
+      "display": {
+        "default_name": "StarRailUID"
+      },
+      "capabilities": [
+        {
+          "capability_id": "query",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "read_only",
+          "privacy_floor": "public"
+        },
+        {
+          "capability_id": "direct",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "read_only",
+          "privacy_floor": "owner"
+        }
+      ],
+      "commands": [
+        {
+          "operation_path": "query",
+          "capability_id": "query",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "执行已加载的星铁上游查询指令"
+        },
+        {
+          "operation_path": "direct",
+          "capability_id": "direct",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "在私聊接收上游文本或图片"
+        }
+      ]
+    },
+    {
+      "module_id": "sayugs",
+      "route": "sayugs",
+      "category": "game",
+      "factory_entry": "sayu.module:GenshinFactory",
+      "module_version": "0.2.0",
+      "display": {
+        "default_name": "GenshinUID"
+      },
+      "capabilities": [
+        {
+          "capability_id": "query",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "read_only",
+          "privacy_floor": "public"
+        },
+        {
+          "capability_id": "direct",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "read_only",
+          "privacy_floor": "owner"
+        }
+      ],
+      "commands": [
+        {
+          "operation_path": "query",
+          "capability_id": "query",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "执行已加载的原神上游查询指令"
+        },
+        {
+          "operation_path": "direct",
+          "capability_id": "direct",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "在私聊接收上游文本或图片"
+        }
+      ]
+    },
+    {
+      "module_id": "sayuww",
+      "route": "sayuww",
+      "category": "game",
+      "factory_entry": "sayu.module:WavesFactory",
+      "module_version": "0.2.0",
+      "display": {
+        "default_name": "XutheringWavesUID"
+      },
+      "capabilities": [
+        {
+          "capability_id": "query",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "read_only",
+          "privacy_floor": "owner"
+        }
+      ],
+      "commands": [
+        {
+          "operation_path": "query",
+          "capability_id": "query",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "在私聊执行已加载的鸣潮上游查询指令"
+        }
+      ]
+    }
+  ],
+  "display_name": "Sayu Loader DLC",
+  "module_order": [
+    "sayusr",
+    "sayugs",
+    "sayuww"
+  ],
+  "release": "0.2.0",
+  "module_contract": {
+    "major": 2,
+    "minimum_minor": 0
+  },
+  "required_features": [
+    "output.cards/1"
+  ],
+  "optional_features": [],
+  "data": {
+    "schema": 1,
+    "readable": [
+      1
+    ],
+    "writes": 1
+  }
+}

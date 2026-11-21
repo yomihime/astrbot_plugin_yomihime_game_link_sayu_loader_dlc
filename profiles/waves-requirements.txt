@@ -1,0 +1,9 @@
+annotated-types==0.6.0
+msgspec==0.20.0
+Pillow==11.3.0
+pydantic==2.12.4
+pydantic-core==2.41.5
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+dulwich==1.2.21
+urllib3==2.8.0

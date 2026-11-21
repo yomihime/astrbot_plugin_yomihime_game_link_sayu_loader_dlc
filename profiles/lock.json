@@ -1,0 +1,29 @@
+{
+  "starrail": {
+    "directory": "StarRailUID",
+    "repository": "baiqwerdvd/StarRailUID",
+    "commit": "739a80a26b7a137b6b7b7d45435c769822de06d0",
+    "version": "0.2.0",
+    "package": "StarRailUID",
+    "prefix": "sr",
+    "snapshot_sha256": "ca7c50e9ab63418ef78669a5ddf7fe7b7e5f0d9cdc98d00c68c54425946a3b32"
+  },
+  "genshin": {
+    "directory": "upstream",
+    "repository": "KimigaiiWuyi/GenshinUID",
+    "commit": "319b13465a60f96a2db2d5d569ca6a15128a9f2f",
+    "version": "6.4.0",
+    "package": "GenshinUID",
+    "prefix": "gs",
+    "snapshot_sha256": "68779e970316013900a375ebba9a13f3b0ccfc2d62e1aeffd6e49381f1ba488a"
+  },
+  "waves": {
+    "directory": "upstream",
+    "repository": "Loping151/XutheringWavesUID",
+    "commit": "7248f8cda8aa3164aca560e145e306a829e3c49d",
+    "version": "3.8.1",
+    "package": "XutheringWavesUID",
+    "prefix": "ww",
+    "snapshot_sha256": "b8c0826bf2af3b767b905a5d2dbe0cecace959b1715b4e1b0b217f644d1f2538"
+  }
+}

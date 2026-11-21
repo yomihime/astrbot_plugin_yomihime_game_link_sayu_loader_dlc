@@ -1,0 +1,7 @@
+name: astrbot_plugin_yomihime_game_link_sayu_loader_dlc
+display_name: 如月怜的游戏连结：Sayu Loader DLC
+desc: 通过游戏连结命令加载指定版本的早柚插件功能。
+version: v0.2.0
+author: yomihime
+repo: https://github.com/yomihime/astrbot_plugin_yomihime_game_link_sayu_loader_dlc
+astrbot_version: ">=4.29.1"

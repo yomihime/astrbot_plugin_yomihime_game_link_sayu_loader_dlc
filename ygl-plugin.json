@@ -1,0 +1,10 @@
+{
+  "schema": "ygl.plugin/1",
+  "role": "dlc",
+  "package_id": "sayu_loader",
+  "manifest": "packages/sayu_loader/yomihime.manifest.json",
+  "control_protocol": {
+    "name": "ygl.control",
+    "major": 1
+  }
+}
