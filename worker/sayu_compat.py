@@ -2,9 +2,11 @@
 
 import base64
 import binascii
+import asyncio
 import logging
 import re
 import sys
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -13,13 +15,14 @@ from os import PathLike
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+from plugin_settings import MODELS, configuration_type
+from service_settings import ServiceSettings
+from declarations import Unsupported
+from target_transport import UnsupportedMessage, file_payload
+
 
 class NoMatch(LookupError):
     """No available service accepts this command and conversation."""
-
-
-class UnsupportedMessage(ValueError):
-    """The host cannot deliver this reply without losing content."""
 
 
 @dataclass
@@ -29,11 +32,14 @@ class Route:
     keyword: str
     pattern: object
     handler: object
-    prefix: bool
+    prefix: str
     block: bool
 
 
 _routes = []
+_plugin_settings = {}
+_services = {}
+_service_store = None
 _prefix = ""
 _plugin = ""
 _data_root = None
@@ -50,6 +56,8 @@ MAX_INPUT_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_INPUT_PIXELS = 12_000_000
 _MAX_TEXT = 4096
 _MAX_PARTS = 32
+_GAPS = " \t\u3000\u00a0"
+_GAP_PATTERN = "[" + _GAPS + "]"
 
 
 def package(name, directory=None):
@@ -90,7 +98,7 @@ def registered_triggers():
             "handler": route.handler.__module__ + "." + route.handler.__qualname__,
             "mode": route.mode,
             "pattern": route.keyword,
-            "prefix": route.prefix,
+            "prefix": bool(route.prefix),
             "area": route.service.area,
         }
         for route in _routes
@@ -102,23 +110,37 @@ def _literal_pattern(keyword):
     pieces = []
     previous = ""
     for char in keyword:
-        if char.isspace():
-            if not previous.isspace():
-                pieces.append(r"\s+")
+        if char in _GAPS:
+            if not previous or previous not in _GAPS:
+                pieces.append(_GAP_PATTERN + "+")
         else:
-            if previous and not previous.isspace():
+            if previous and previous not in _GAPS:
                 han = "\u3400" <= char <= "\u9fff"
                 prev_han = "\u3400" <= previous <= "\u9fff"
                 if (han and previous.isascii() and previous.isalnum()) or (
                     prev_han and char.isascii() and char.isalnum()
                 ):
-                    pieces.append(r"\s*")
+                    pieces.append(_GAP_PATTERN + "*")
             pieces.append(re.escape(char))
         previous = char
     return "".join(pieces)
 
 
+def check_redeclaration(instance, options):
+    for key, declared in instance._restrictions.items():
+        if key in options:
+            value = tuple(options[key]) if key.endswith("_list") else options[key]
+            if value != declared:
+                raise Unsupported("conflicting permission declarations for one name")
+
+
 class SV:
+    def __new__(cls, name="", **kwargs):
+        if _service_store is not None and name in _services:
+            check_redeclaration(_services[name], kwargs)
+            return _services[name]
+        return super().__new__(cls)
+
     def __init__(
         self,
         name="",
@@ -131,14 +153,37 @@ class SV:
         white_list=(),
         **options,
     ):
+        if options:
+            raise Unsupported("unsupported service options")
+        if getattr(self, "_initialized", False):
+            return
         self.name = name
         self.pm = pm
         self.priority = priority
         self.area = area
-        # The bridge has no upstream group/identity ACL or aside capability.
-        self.enabled = enabled and not (
-            black_list or white_list or any(options.values())
-        )
+        self.enabled = enabled
+        self._restrictions = {
+            "pm": pm,
+            "area": area,
+            "black_list": tuple(black_list),
+            "white_list": tuple(white_list),
+        }
+        self._acl_blocked = bool(black_list or white_list)
+        if _service_store is not None:
+            _service_store.restore("service", self)
+            _services[name] = self
+        self._initialized = True
+
+    def set(self, is_lazy=True, **changes):
+        if _service_store is None or _services.get(self.name) is not self:
+            raise Unsupported("service management requires the active package")
+        _service_store.update("service", self, changes)
+
+    def enable(self):
+        self.set(enabled=True)
+
+    def disable(self):
+        self.set(enabled=False)
 
     def register(
         self,
@@ -152,20 +197,37 @@ class SV:
         **options,
     ):
         def decorate(handler):
-            if to_me or any(options.values()) or not self.enabled:
-                return handler
+            if to_me or options or (_service_store is not None and to_ai):
+                raise Unsupported("unsupported trigger options")
+            if _service_store is None and (not self.enabled or self._acl_blocked):
+                raise Unsupported("restricted service")
             words = (commands,) if isinstance(commands, str) else commands
             for word in dict.fromkeys(words):
                 if not isinstance(word, str) or not word:
                     raise ValueError("invalid trigger keyword")
-                expression = word if mode == "regex" else _literal_pattern(word)
+                expression = (
+                    word
+                    if mode == "regex"
+                    else re.escape(word)
+                    if mode == "keyword"
+                    else _literal_pattern(word)
+                )
                 if mode == "suffix":
                     expression += r"\Z"
-                _routes.append(
-                    Route(
-                        self, mode, word, re.compile(expression), handler, prefix, block
+                settings = _plugin_settings.get(_plugin)
+                prefixes = settings.prefixes if settings else (_prefix,)
+                for literal_prefix in prefixes if prefix and prefixes else ("",):
+                    _routes.append(
+                        Route(
+                            self,
+                            mode,
+                            word,
+                            re.compile(expression),
+                            handler,
+                            literal_prefix,
+                            block,
+                        )
                     )
-                )
             return handler
 
         return decorate
@@ -190,12 +252,67 @@ class SV:
 
     def on_file(self, commands, **options):
         # This transport carries text input only.
-        return lambda handler: handler
+        raise Unsupported("file input is unavailable")
 
 
 class Plugins:
-    def __init__(self, name="", **options):
+    def __new__(cls, name="", **kwargs):
+        if _service_store is not None and name in _plugin_settings:
+            check_redeclaration(_plugin_settings[name], kwargs)
+            return _plugin_settings[name]
+        return super().__new__(cls)
+
+    def __init__(
+        self,
+        name="",
+        *,
+        pm=6,
+        priority=5,
+        enabled=True,
+        area="SV",
+        prefix=(),
+        force_prefix=(),
+        allow_empty_prefix=None,
+        alias=(),
+        black_list=(),
+        white_list=(),
+        bot_black_list=(),
+        bot_white_list=(),
+        **options,
+    ):
+        if name != _plugin or options:
+            raise Unsupported("unsupported plugin configuration")
+        if getattr(self, "_initialized", False):
+            return
         self.name = name
+        self.area = area
+        self.pm = pm
+        self.priority = priority
+        self.enabled = enabled
+        self._restrictions = {
+            "pm": pm,
+            "area": area,
+            "black_list": tuple(black_list),
+            "white_list": tuple(white_list),
+            "bot_white_list": tuple(bot_white_list),
+            "bot_black_list": tuple(bot_black_list),
+        }
+        self._acl_blocked = bool(
+            black_list or white_list or bot_black_list or bot_white_list
+        )
+        prefixes = (prefix,) if isinstance(prefix, str) else tuple(prefix)
+        self.prefixes = tuple(dict.fromkeys((*prefixes, *force_prefix)))
+        if allow_empty_prefix or (allow_empty_prefix is None and not self.prefixes):
+            self.prefixes += ("",)
+        if _service_store is not None:
+            _service_store.restore("plugin", self)
+        _plugin_settings[name] = self
+        self._initialized = True
+
+    def set(self, is_lazy=True, **changes):
+        if _service_store is None or _plugin_settings.get(self.name) is not self:
+            raise Unsupported("plugin management requires the active package")
+        _service_store.update("plugin", self, changes)
 
 
 class Event(SimpleNamespace):
@@ -222,8 +339,8 @@ class MessageSegment:
         return Message("node", content_list)
 
     @staticmethod
-    def file(name, content):
-        return Message("file", content)
+    def file(content, file_name):
+        return Message("file", file_payload(content, file_name))
 
 
 @dataclass
@@ -234,12 +351,35 @@ class Button:
     prefix: str = ""
 
 
-class _BotLog:
-    async def info(self, *args, **kwargs):
-        # Upstream diagnostic strings can include private identifiers.
-        pass
+# Log frames belong to the adapter, not to a chat recipient. Keep a bounded,
+# generation-local channel. The management inventory exposes only level counts.
+_adapter_frames = deque(maxlen=32)
+_adapter_counts = Counter()
 
-    debug = warning = error = info
+
+class _BotLog:
+    @staticmethod
+    def emit(level, message):
+        if not isinstance(message, str):
+            raise TypeError("expected a log message")
+        _adapter_frames.append((level, message[:1024]))
+        _adapter_counts[level] += 1
+
+    async def info(self, msg):
+        self.emit("INFO", msg)
+
+    async def warning(self, msg):
+        self.emit("WARNING", msg)
+
+    async def error(self, msg):
+        self.emit("ERROR", msg)
+
+    async def success(self, msg):
+        self.emit("SUCCESS", msg)
+
+
+def adapter_log_counts():
+    return dict(_adapter_counts)
 
 
 def _image_bytes(value):
@@ -368,11 +508,84 @@ async def get_new_help(
 
 
 class Bot:
-    def __init__(self):
+    def __init__(self, *, target_transport=None, interaction=None):
+        self._target_transport = target_transport
+        self._interaction = interaction
         self.messages = []
         self.logger = _BotLog()
         self.image_size = 0
         self.text_size = 0
+
+    async def target_send(
+        self,
+        message,
+        target_type,
+        target_id,
+        at_sender=False,
+        sender_id="",
+        send_source_group=None,
+        wait_recall=False,
+    ):
+        if self._target_transport is None:
+            raise UnsupportedMessage("host target delivery unavailable")
+        if at_sender or sender_id or send_source_group or wait_recall:
+            raise UnsupportedMessage("target metadata or recall unsupported")
+        await self._target_transport.send(target_type, target_id, message)
+
+    async def receive_resp(
+        self,
+        reply=None,
+        option_list=None,
+        unsuported_platform=False,
+        is_mutiply=False,
+        is_recive=True,
+        timeout=60,
+        sep="\n",
+        command_tips="请输入以下命令之一:",
+        command_start_text="",
+        at_sender=False,
+    ):
+        if self._interaction is None:
+            raise UnsupportedMessage("host interactive replies unavailable")
+        if (
+            option_list
+            or at_sender
+            or (reply is not None and not isinstance(reply, str))
+        ):
+            raise UnsupportedMessage("interactive port accepts plain prompts only")
+        if reply:
+            await self._interaction.prompt(reply)
+        if is_mutiply or is_recive:
+            try:
+                return await asyncio.wait_for(
+                    self._interaction.receive(is_mutiply), timeout
+                )
+            except TimeoutError:
+                if is_mutiply:
+                    raise
+                return None
+
+    async def receive_mutiply_resp(
+        self,
+        reply=None,
+        option_list=None,
+        unsuported_platform=False,
+        timeout=60,
+        sep="\n",
+        command_tips="请输入以下命令之一:",
+        command_start_text="",
+    ):
+        return await self.receive_resp(
+            reply,
+            option_list,
+            unsuported_platform,
+            True,
+            True,
+            timeout,
+            sep,
+            command_tips,
+            command_start_text,
+        )
 
     def _append(self, value):
         if isinstance(value, (list, tuple)):
@@ -408,7 +621,13 @@ class Bot:
             raise UnsupportedMessage("unsupported message segment")
 
     async def send(self, message, at_sender=False):
-        self._append(message)
+        previous = len(self.messages), self.text_size, self.image_size
+        try:
+            self._append(message)
+        except UnsupportedMessage:
+            count, self.text_size, self.image_size = previous
+            del self.messages[count:]
+            raise
 
     async def send_option(self, value, options):
         await self.send(value)
@@ -430,18 +649,21 @@ class Bot:
 
 def get_res_path(name=None):
     root = _data_root / "resources"
-    if name is not None:
+    if isinstance(name, Path):
+        root = name if name.is_absolute() else root / name
+    elif name is not None:
         parts = name if isinstance(name, (tuple, list)) else (name,)
         for part in parts:
             if (
                 not isinstance(part, str)
-                or Path(part).name != part
-                or part in ("", ".", "..")
+                or not part
+                or Path(part).anchor
+                or ".." in Path(part).parts
             ):
                 raise ValueError("invalid resource directory")
             root /= part
-    if not root.resolve().is_relative_to(_data_root):
-        raise ValueError("resource directory outside data root")
+    if not root.resolve().is_relative_to(_data_root / "resources"):
+        raise ValueError("resource directory outside plugin resources")
     root.mkdir(exist_ok=True, parents=True)
     return root
 
@@ -452,37 +674,35 @@ def get_plugin_available_prefix(name):
     return _prefix
 
 
-class _ConfigValue:
-    def __init__(self, name, desc, data, *display_args, **display_options):
-        self.name = name
-        self.desc = desc
-        self.data = data
-
-
-class StringConfig:
-    """Read defaults declared by the package without opening any host configuration."""
-
-    def __init__(self, name, path, defaults):
-        self._defaults = defaults
-
-    def get_config(self, key):
-        return self._defaults[key]
-
-
 def to_thread(function):
-    # A worker owns one request and is already isolated from the host event loop.
+    import asyncio
+    import inspect
+
     @wraps(function)
     async def run(*args, **kwargs):
-        return function(*args, **kwargs)
+        if inspect.iscoroutinefunction(function):
+            return await asyncio.to_thread(
+                lambda: asyncio.run(function(*args, **kwargs))
+            )
+        return await asyncio.to_thread(function, *args, **kwargs)
 
     return run
 
 
-def install(plugin, prefix, data_root, *, source_root=None):
-    global _plugin, _prefix, _data_root, _source
+def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
+    global _plugin, _prefix, _data_root, _source, _service_store
     _routes.clear()
+    _adapter_frames.clear()
+    _adapter_counts.clear()
+    _plugin_settings.clear()
+    _services.clear()
     _plugin, _prefix = plugin, prefix
     _data_root = Path(data_root).resolve()
+    if runtime_mode is None:
+        runtime_mode = getattr(
+            sys.modules.get("game_profile"), "RUNTIME_MODE", "package"
+        )
+    _service_store = ServiceSettings(_data_root) if runtime_mode == "package" else None
     _source = (
         Path(source_root).resolve()
         if source_root
@@ -490,6 +710,7 @@ def install(plugin, prefix, data_root, *, source_root=None):
     )
     package("gsuid_core")
     sv = package("gsuid_core.sv")
+    sv.SL = SimpleNamespace(plugins=_plugin_settings, lst=_services)
     sv.SV = SV
     sv.Plugins = Plugins
     sv.get_plugin_available_prefix = get_plugin_available_prefix
@@ -507,18 +728,15 @@ def install(plugin, prefix, data_root, *, source_root=None):
         lambda key, **fields: key.format_map(fields) if fields else key
     )
     package("gsuid_core.utils")
-    package("gsuid_core.pool").to_thread = to_thread
+    pool = package("gsuid_core.pool")
+    pool.to_thread = pool.run_in_thread_pool = to_thread
     package("gsuid_core.utils.plugins_config")
     config = package("gsuid_core.utils.plugins_config.models")
-    for name in (
-        "GsBoolConfig",
-        "GsImageConfig",
-        "GsIntConfig",
-        "GsListStrConfig",
-        "GsStrConfig",
-    ):
-        setattr(config, name, _ConfigValue)
-    package("gsuid_core.utils.plugins_config.gs_config").StringConfig = StringConfig
+    for name, model in MODELS.items():
+        setattr(config, name, model)
+    package(
+        "gsuid_core.utils.plugins_config.gs_config"
+    ).StringConfig = configuration_type(_data_root)
     package("gsuid_core.utils.image")
     package("gsuid_core.utils.image.convert").convert_img = convert_img
     package("gsuid_core.help")
@@ -528,21 +746,35 @@ def install(plugin, prefix, data_root, *, source_root=None):
 
 def _match(route, raw, kind):
     service = route.service
-    if service.pm < 6 or service.area not in ("ALL", kind.upper()):
+    settings = _plugin_settings.get(_plugin)
+    if settings and (
+        not settings.enabled
+        or settings.pm < 6
+        or settings._acl_blocked
+        or settings.area not in ("SV", "ALL", kind.upper())
+    ):
         return None
-    text = raw.strip()
-    if route.prefix:
-        if not text.startswith(_prefix):
-            return None
-        text = text[len(_prefix) :].lstrip()
+    if (
+        not service.enabled
+        or service._acl_blocked
+        or service.pm < 6
+        or service.area not in ("ALL", kind.upper())
+    ):
+        return None
+    text = raw.strip(_GAPS)
+    if not text.startswith(route.prefix):
+        return None
+    body = text[len(route.prefix) :].lstrip(_GAPS)
 
     pattern = route.pattern
     if route.mode == "fullmatch":
-        match = pattern.fullmatch(text)
-    elif route.mode in ("suffix", "regex", "keyword"):
+        match = pattern.fullmatch(body)
+    elif route.mode == "keyword":
         match = pattern.search(text)
+    elif route.mode in ("suffix", "regex"):
+        match = pattern.search(body)
     else:
-        match = pattern.match(text)
+        match = pattern.match(body)
     if match is None:
         return None
     if route.mode == "regex":
@@ -553,7 +785,12 @@ def _match(route, raw, kind):
             regex_dict=match.groupdict(),
             regex_group=groups,
         )
-    remainder = (text[: match.start()] + text[match.end() :]).strip()
+    if route.mode in ("suffix", "keyword"):
+        head = re.match(_literal_pattern(route.keyword), body)
+        remainder = body[head.end() :] if head else body.replace(route.keyword, "", 1)
+    else:
+        remainder = body[match.end() :]
+    remainder = remainder.strip(_GAPS)
     if route.mode in ("prefix", "suffix") and not remainder:
         return None
     return dict(text=remainder, command=route.keyword, regex_group=(), regex_dict={})
@@ -577,14 +814,14 @@ async def dispatch(
             not r.prefix,
             r.service.priority,
             _ranks[r.mode],
-            -len(r.keyword) if r.mode != "regex" else 0,
+            -len(r.keyword)
+            if r.mode in {"fullmatch", "command", "prefix", "suffix"}
+            else 0,
         ),
     )
     bot = Bot()
-    invoked = set()
+    invoked = False
     for route in ordered:
-        if route.handler in invoked:
-            continue
         kind = "group" if group_id else conversation_kind
         fields = _match(route, text, kind)
         if fields is None:
@@ -610,7 +847,7 @@ async def dispatch(
             file_name=None,
         )
         await route.handler(bot, event)
-        invoked.add(route.handler)
+        invoked = True
         if route.block:
             break
     if not invoked:

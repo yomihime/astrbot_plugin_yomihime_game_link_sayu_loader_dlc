@@ -116,7 +116,7 @@ class PublicResources:
         endpoint = self.directories.get(path.parent)
         if not endpoint or not re.fullmatch(r"[0-9]{1,12}\.png", path.name):
             return False
-        # Each worker serves one chat message. Repeated checks reuse its first result.
+        # Repeated checks in this invocation reuse the first result.
         if path in self.attempted or len(self.attempted) >= 4:
             return False
         self.attempted.add(path)

@@ -9,6 +9,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from environments import selected
 from snapshot import file_digest, pinned_snapshot, zip_entry
 
 
@@ -29,29 +30,40 @@ def archive(files):
     return stream.getvalue()
 
 
-def prepare(key, lock):
-    directory = LOCAL / key
-    exe = (
-        directory / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    )
-    if not exe.is_file():
-        raise RuntimeError(f"Missing private Python for {key}")
+def worker_archive(lock):
     worker = ROOT / "worker"
     files = {
         path.relative_to(worker).as_posix(): path.read_bytes()
         for path in worker.rglob("*.py")
     }
+    license_path = "licenses/gsuid_core-COPYING.txt"
+    files[license_path] = (worker / license_path).read_bytes()
     files["__main__.py"] = files.pop("entry.py")
     files["game_profile.py"] = (
         f"PACKAGE = {lock['package']!r}\nPREFIX = {lock['prefix']!r}\n"
+        f"RUNTIME_MODE = {lock.get('runtime_mode', 'package')!r}\n"
     ).encode("utf-8")
+    return archive(files)
+
+
+def prepare(key, lock):
+    directory = LOCAL / key
+    requirements = ROOT / "profiles" / f"{key}-requirements.txt"
+    exe, _ = selected(directory, requirements.read_bytes())
     runtime = LOCAL / "runtime"
     snapshot = pinned_snapshot(directory, lock, runtime)
-    blob = archive(files)
+    blob = worker_archive(lock)
     sha = digest(blob)
     target = runtime / f"{key}-{sha}.pyz"
     publish_archive(target, blob)
-    return str(exe), str(target), sha, str(snapshot), lock["snapshot_sha256"]
+    return (
+        str(exe),
+        str(target),
+        sha,
+        str(snapshot),
+        lock["snapshot_sha256"],
+        str(directory / "data"),
+    )
 
 
 def publish_archive(target, data):

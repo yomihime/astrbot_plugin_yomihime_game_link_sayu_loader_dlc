@@ -11,6 +11,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from build_local import ROOT, ROOT_NAME
 
@@ -24,6 +25,20 @@ async def check(core, cases, list_commands=False):
     protocol = load("extensions.hot_update_protocol")
     sdk = load("yomihime_game_link_sdk")
     validate = load("core.contracts.validation_boundary").validate_contract
+    rendering = load("presentation.rendering")
+    renderer = rendering.GenericDisplayRenderer(
+        rendering.RenderingBounds(3000, 100, 32, 50, 1, 1, 1, 32, 8)
+    )
+
+    async def rendered_text(doc):
+        audience = sdk.DisplayAudience(doc.privacy.value)
+        output = await renderer.render(
+            doc, limits=sdk.DisplayLimits(2, 4096), audience=audience
+        )
+        prefix = f"{doc.title}\n{doc.subject}\n"
+        assert output.text.startswith(prefix)
+        return output.text[len(prefix) :]
+
     with tempfile.TemporaryDirectory(prefix="sayu-check-") as temp:
         with zipfile.ZipFile(ROOT / "dist" / (ROOT_NAME + ".zip")) as candidate:
             release = protocol.parse_release(candidate.read("release.json"))
@@ -44,6 +59,11 @@ async def check(core, cases, list_commands=False):
             candidate.extractall(temp)
         sys.path.insert(0, str(Path(temp) / "packages"))
         sys.modules["sayu_loader._api_v2"] = sdk
+        runtime = importlib.import_module("sayu_loader.sayu.runtime")
+        runtime.WORKERS = {
+            key: (*binding[:-1], str(Path(temp) / "test-data" / key))
+            for key, binding in runtime.WORKERS.items()
+        }
         manifests = {m.route: m for m in manifest.modules}
         modules = {}
         handlers = {}
@@ -80,7 +100,7 @@ async def check(core, cases, list_commands=False):
                     )
                     raise AssertionError("Core renderer returned only fallback text")
                 return f"{route} JPEG bytes={len(raw)} sha256={expected}, Core PNG={len(preview.bitmap.content)} bytes"
-            message = doc.ordered_blocks[0].text
+            message = await rendered_text(doc)
             assert expected in message, (route, message)
             if route == "sayuww":
                 assert doc.privacy == sdk.Privacy.PRIVATE
@@ -95,18 +115,10 @@ async def check(core, cases, list_commands=False):
         for route in cases:
             await start(route)
 
-        bridge = importlib.import_module("sayu_loader.sayu.module")
         for route, module in modules.items():
-            with tempfile.TemporaryDirectory(prefix="sayu-inventory-") as directory:
-                inventory = await asyncio.wait_for(
-                    bridge.exchange(
-                        bridge.WORKERS[module.key][0],
-                        Path(module.generation.name),
-                        {"op": "inventory", "list_triggers": list_commands},
-                        directory,
-                    ),
-                    30,
-                )
+            inventory = await asyncio.wait_for(
+                module.exchange({"op": "inventory", "list_triggers": list_commands}), 30
+            )
             counts = inventory["registered"]
             assert counts["handlers"] > 1 and counts["triggers"] >= counts["handlers"]
             print(
@@ -137,7 +149,32 @@ async def check(core, cases, list_commands=False):
         assert mixed.card.blocks[0].content == "first"
         assert mixed.card.blocks[1].asset.content == bitmap
         assert mixed.card.blocks[2].content == "last"
-        assert mixed.ordered_blocks[0].text == "first\n\nlast"
+        assert await rendered_text(mixed) == "first\n\nlast\n\n图片未显示。"
+        assignments = "委托一\n委托二\n委托三\n委托四"
+        for privacy in (sdk.Privacy.PRIVATE, sdk.Privacy.PUBLIC):
+            for body in (
+                assignments,
+                "\n".join(f"line {i}" if i % 4 else "" for i in range(1, 140)),
+            ):
+                doc = await public.document(None, "test", [{"text": body}], privacy)
+                assert await rendered_text(doc) == body
+        with patch.object(
+            public.module,
+            "exchange",
+            AsyncMock(return_value={"parts": [{"text": "line\n" * 199}]}),
+        ):
+            too_many = await public.invoke(None, {"text": "test"})
+        assert (
+            too_many.status is sdk.ResultStatus.ERROR
+            and too_many.error.code is sdk.ErrorCode.UNSUPPORTED
+        )
+        extra_images = {"parts": [{"image": encoded}, {"image": encoded}]}
+        with patch.object(
+            public.module, "exchange", AsyncMock(return_value=extra_images)
+        ):
+            rejected = await public.invoke(None, {"text": "test"})
+        assert rejected.status is sdk.ResultStatus.ERROR
+        assert rejected.error.code is sdk.ErrorCode.UNSUPPORTED
         ctx = SimpleNamespace(
             actor_id="test-user",
             invocation_id="event",
@@ -159,17 +196,13 @@ async def check(core, cases, list_commands=False):
         # Exercise the owner transport against the same upstream JPEG. The public
         # card path retains the original bytes; the private path requires a PNG.
         genshin = modules["sayugs"]
-        with tempfile.TemporaryDirectory(prefix="sayu-owner-") as work:
-            direct = await bridge.exchange(
-                bridge.WORKERS[genshin.key][0],
-                Path(genshin.generation.name),
-                {
-                    "text": cases["sayugs"][0],
-                    "event": genshin.event(None, True),
-                    "private_image": True,
-                },
-                work,
-            )
+        direct = await genshin.exchange(
+            {
+                "text": cases["sayugs"][0],
+                "event": genshin.event(None, True),
+                "private_image": True,
+            }
+        )
         png = base64.b64decode(direct["parts"][0]["image"], validate=True)
         assert png.startswith(b"\x89PNG\r\n\x1a\n") and len(png) <= 4 * 1024 * 1024
         for route, text in (

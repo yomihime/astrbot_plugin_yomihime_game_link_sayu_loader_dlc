@@ -79,6 +79,13 @@ def _encode(image, scale, budget, *, public=False, minimum=MIN_SCALE):
         if public and stream.tell() > budget and frame.mode == "RGB":
             stream = BytesIO()
             frame.save(stream, format="JPEG", quality=90, subsampling=0)
+        if public and stream.tell() > budget and frame.mode == "RGBA":
+            # Card PNGs support indexed transparency. Retain the alpha channel
+            # and try a compact palette before sacrificing label resolution.
+            stream = BytesIO()
+            frame.quantize(colors=256, method=Image.Quantize.FASTOCTREE).save(
+                stream, format="PNG", optimize=True
+            )
         if stream.tell() <= budget:
             return {"image": base64.b64encode(stream.getvalue()).decode("ascii")}
         if scale <= minimum:
@@ -86,7 +93,11 @@ def _encode(image, scale, budget, *, public=False, minimum=MIN_SCALE):
         scale = max(minimum, scale * min(0.9, sqrt(budget / stream.tell())))
 
 
-def prepare_public_parts(parts):
+def prepare_public_parts(parts, source, package):
+    if sum("image" in part for part in parts) > 1:
+        # The public command card has one 640 px image slot for this
+        # projection. Check readability at the size the recipient sees.
+        return _compose(parts, source, package, public=True)
     result = []
     remaining_pixels = MAX_INPUT_PIXELS
     for part in parts:
@@ -120,7 +131,7 @@ def _wrap_text(text, font, width):
                 else:
                     hi = mid
             if not lo:
-                raise UnsupportedMessage("text exceeds private image width")
+                raise UnsupportedMessage("text exceeds image width")
             lines.append(line[:lo])
             line = line[lo:]
         lines.append(line)
@@ -129,8 +140,12 @@ def _wrap_text(text, font, width):
 
 def prepare_owner_parts(parts, source, package):
     """Return text unchanged or a single PNG containing the entire reply in order."""
+    return _compose(parts, source, package, public=False)
+
+
+def _compose(parts, source, package, *, public):
     if not parts or len(parts) > 32:
-        raise UnsupportedMessage("invalid private message chain")
+        raise UnsupportedMessage("invalid message chain")
     if all(
         isinstance(part, dict)
         and part.keys() == {"text"}
@@ -157,11 +172,11 @@ def prepare_owner_parts(parts, source, package):
             text = part["text"]
             total_text += len(text)
             if total_text > 4096:
-                raise UnsupportedMessage("private text exceeds reply limit")
+                raise UnsupportedMessage("text exceeds reply limit")
             has_text = True
             content.append(text)
         else:
-            raise UnsupportedMessage("unknown private message part")
+            raise UnsupportedMessage("unknown message part")
 
     if len(content) == 1:
         image = content[0]
@@ -184,7 +199,10 @@ def prepare_owner_parts(parts, source, package):
         else:
             layout.append((height, item))
             height += item.height
-    scale = _fit_scale(width, height, MAX_WIDTH, MAX_HEIGHT, MAX_PIXELS)
+    if public:
+        scale = _fit_scale(width, height, 640, 640, PUBLIC_PIXELS)
+    else:
+        scale = _fit_scale(width, height, MAX_WIDTH, MAX_HEIGHT, MAX_PIXELS)
 
     alpha = any(
         isinstance(item, Image.Image) and item.mode == "RGBA" for item in content
@@ -214,4 +232,12 @@ def prepare_owner_parts(parts, source, package):
                     _scaled_size(item.size, scale), Image.Resampling.LANCZOS
                 )
             canvas.paste(item, ((canvas.width - item.width) // 2, int(y * scale)))
-    return [_encode(canvas, 1.0, MAX_BYTES, minimum=MIN_SCALE / scale)]
+    return [
+        _encode(
+            canvas,
+            1.0,
+            PUBLIC_BYTES if public else MAX_BYTES,
+            public=public,
+            minimum=MIN_SCALE / scale,
+        )
+    ]

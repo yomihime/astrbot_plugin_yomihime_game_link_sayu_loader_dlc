@@ -6,6 +6,7 @@
     "version": "0.2.0",
     "package": "StarRailUID",
     "prefix": "sr",
+    "runtime_mode": "declarations",
     "snapshot_sha256": "ca7c50e9ab63418ef78669a5ddf7fe7b7e5f0d9cdc98d00c68c54425946a3b32"
   },
   "genshin": {
@@ -15,6 +16,7 @@
     "version": "6.4.0",
     "package": "GenshinUID",
     "prefix": "gs",
+    "runtime_mode": "declarations",
     "snapshot_sha256": "68779e970316013900a375ebba9a13f3b0ccfc2d62e1aeffd6e49381f1ba488a"
   },
   "waves": {
@@ -24,6 +26,7 @@
     "version": "3.8.1",
     "package": "XutheringWavesUID",
     "prefix": "ww",
+    "runtime_mode": "declarations",
     "snapshot_sha256": "b8c0826bf2af3b767b905a5d2dbe0cecace959b1715b4e1b0b217f644d1f2538"
   }
 }

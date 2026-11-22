@@ -50,7 +50,9 @@ class PortsTests(unittest.TestCase):
 
         self.assertEqual(self.dispatch("exabc"), [{"text": "one"}])
         parts = self.dispatch("ex abc d", actor_id="A", group_id="G", message_id="M")
-        self.assertEqual(parts, [{"text": "abc"}, {"text": "c d"}, {"text": "c"}])
+        self.assertEqual(
+            parts, [{"text": "abc"}, {"text": "c d"}, {"text": "bc d"}, {"text": "c"}]
+        )
         self.assertEqual(calls[-1].regex_group, ("c",))
         self.assertEqual(
             (calls[-1].user_id, calls[-1].user_type, calls[-1].msg_id),
@@ -88,6 +90,29 @@ class PortsTests(unittest.TestCase):
             self.dispatch("exexample arg", conversation_kind="direct"),
             [{"text": "arg"}],
         )
+
+    def test_keyword_tie_preserves_registration_order(self):
+        service = host.SV("keywords")
+
+        @service.on_keyword("a", block=True)
+        async def short(bot, ev):
+            await bot.send("first")
+
+        @service.on_keyword("ab", block=True)
+        async def long(bot, ev):
+            await bot.send("second")
+
+        self.assertEqual(self.dispatch("exabc"), [{"text": "first"}])
+
+    def test_plugin_authorization_applies_to_public_services(self):
+        host.Plugins("Example", pm=2, force_prefix=["ex"])
+
+        @host.SV("public").on_command("ping")
+        async def ping(bot, ev):
+            self.fail("privileged plugin executed")
+
+        with self.assertRaises(host.NoMatch):
+            self.dispatch("exping")
 
     def test_suffix_and_priority(self):
         @host.SV("early", priority=1).on_suffix("tail", prefix=False, block=True)
@@ -127,7 +152,7 @@ class PortsTests(unittest.TestCase):
         @host.SV("segments").on_command("sample", block=True)
         async def segments(bot, ev):
             if ev.text:
-                await bot.send(host.MessageSegment.file("file", pixel))
+                await bot.send(host.MessageSegment.file(pixel, "file.png"))
                 return
             await bot.send("before")
             await bot.send(
@@ -152,6 +177,23 @@ class PortsTests(unittest.TestCase):
         )
         with self.assertRaises(host.UnsupportedMessage):
             self.dispatch("exsample file")
+
+    def test_thread_port_resolves_coroutines_on_another_thread(self):
+        import threading
+
+        @host.to_thread
+        async def compute():
+            await asyncio.sleep(0)
+            return threading.get_ident()
+
+        self.assertNotEqual(asyncio.run(compute()), threading.get_ident())
+
+    def test_adapter_log_is_separate_from_chat(self):
+        bot = host.Bot()
+        asyncio.run(bot.logger.info("fixture diagnostic"))
+        self.assertEqual(bot.messages, [])
+        self.assertEqual(host.adapter_log_counts(), {"INFO": 1})
+        self.assertEqual(host._adapter_frames[-1], ("INFO", "fixture diagnostic"))
 
     def test_resources_and_public_prefix(self):
         expected = self.root / "data" / "resources" / "Example" / "nested"

@@ -12,16 +12,17 @@ Sayu Loader 将上游的聊天服务接入 AstrBot 的 Yomihime Game Link（YGL�
 
 ## 服务如何加载
 
-1. `profiles/lock.json` 固定 Git 提交与源包 SHA-256。构建器从 Git 对象生成快照，收录完整上游 Python 包、随包资源、根图标与许可证。三个 profile 只指定上游身份、版本、前缀与完整性信息。
+1. `profiles/lock.json` 固定 Git 提交与源包 SHA-256。构建器从 Git 对象生成快照，收录完整上游 Python 包、随包资源、根图标与许可证。三个 profile 同时声明加载模式。
 2. YGL 通过 `ygl.control/1` 接入 DLC 并注入 SDK。每个模块代际在激活时验证 worker 和源包的摘要，展开一份自己的上游快照。停用时先取消正在运行的请求、回收进程，再清理该代际的源码目录。
-3. 每条消息使用独立的子进程、注册表和空数据目录。发现器读取源码中的服务声明，解析回调所引用的模块、值和辅助函数。包内 JSON、带类型的数据映射和只读启动钩子能在当前进程初始化。能解析依赖的上游装饰器负责注册。星铁别名库与原神图片转换器依赖包初始化或重载定义，另外校验这两个原生辅助模块并限定可调用的只读导出。兼容层按事件匹配触发器，调用原回调，按发送顺序转换文本、图片及消息段。停止和重载后的请求不能沿用旧注册表。
-4. 帐号、权限和输出仍由宿主控制。worker 只收到事件所需的字段，用户、会话和消息标识按模块代际匿名化。插件的数据路径位于该次调用的私有目录，内置资源由固定快照提供。星铁和原神可从上游声明的公开静态目录按文件取图。鸣潮按固定的公开资源 Git 树读取所需图片和 JSON，同类数据表按上游的枚举请求批量获取，并校验对象 ID。这些文件与本条消息的数据目录一起回收。
+3. 每个活动模块有一个常驻 worker。普通包执行包代码和生命周期钩子，按代际管理调度器。三个固定游戏显式使用声明发现模式，选择能解析依赖的上游回调，并在 worker 清单中记录跳过原因。普通包导入失败会返回启动错误。
+4. 每个 profile 独享持久数据目录及稳定的用户化名。重载保留文件并重建 Python 模块状态。独占写锁防止同一 profile 同时启动两个调度器。星铁和原神可按上游声明的静态目录取图，鸣潮资源按固定 Git 树校验。
+5. 原生参照版本、行为差异、双端测试和需要扩展的 YGL 接口见[插件契约清单](docs/plugin-contract.md)。
 
 鸣潮资源版本固定为 `88d84d8d73855dd443c1e568164324ff5ff090d0`。涉及线上素材的指令需要能访问对应发布方。
 
-当前实现面向只读聊天。可用性取决于回调和初始化代码的依赖，包括本地数据是否随固定版本提供。发现器会排除需要未接入接口、受限权限或不支持初始化行为的服务。已接入的接口可以供多个服务共用。登录、签到、账户库、跨消息状态、主动推送、Web 服务、文件交互和完整游戏资源下载流程超出当前范围。公开卡片接受有界的 PNG/JPEG。私聊可直接复制纯文本，图文混排时将各段按发送顺序绘入一张 PNG。图片超过宿主单次投递预算时会等比缩放。静态图须能安全解码，并在缩放后保持可读尺寸。
+当前实现面向只读聊天。可用性取决于回调和初始化代码的依赖，包括本地数据是否随固定版本提供。发现器会排除需要未接入接口、受限权限或不支持初始化行为的服务。已接入的接口可以供多个服务共用。登录、签到、账户库、跨会话投递、主动推送、Web 服务、文件交互和完整游戏资源下载流程超出当前范围。公开卡片接受有界的 PNG/JPEG。私聊可直接复制纯文本，图文混排时将各段按发送顺序绘入一张 PNG。图片超过宿主单次投递预算时会等比缩放。静态图须能安全解码，并在缩放后保持可读尺寸。
 
-### 冻结候选的 WebChat 验收
+### 初版冻结候选的 WebChat 验收
 
 三个模块同时启用，每条消息从空数据目录开始。候选冻结后独立抽取的四条新指令中，三条收到了可核对的业务结果。
 
@@ -38,20 +39,23 @@ StarRailUID 0.2.0 的遗器图鉴按中文套装名遍历 `SetId2Name` 的键，
 
 ## 本机构建与检查
 
-下例使用 Windows Python Launcher。依赖安装到仓库忽略的 `.sayu-local/<profile>/venv`。构建器只把轻量外壳和 YGL 包装入安装 ZIP，引用的私有运行时与内容寻址归档需要保留在本机。移动源码仓库或更换机器后需重新构建。
+下例使用 Windows Python Launcher。每个 profile 的解释器和依赖安装到仓库忽略的 `.sayu-local/<profile>/env-*`。变更依赖清单或基础 Python 后，prepare 会新建环境，安装成功才更新 `environment.json`。构建器将选中的解释器绝对路径写入安装 ZIP。移动源码仓库或更换机器后需重新构建。
 
 ```powershell
 py -3.12 scripts/prepare.py starrail
 py -3.13 scripts/prepare.py genshin
 py -3.13 scripts/prepare.py waves
 python scripts/build_local.py
-& .\.sayu-local\starrail\venv\Scripts\python.exe -m unittest discover -s tests
-& .\.sayu-local\waves\venv\Scripts\python.exe -m unittest discover -s tests
+foreach ($profileName in 'starrail', 'waves') {
+    $dir = ".sayu-local/$profileName"
+    $envName = (Get-Content "$dir/environment.json" -Raw | ConvertFrom-Json).environment
+    & "$dir/$envName/Scripts/python.exe" -m unittest discover -s tests
+}
 python scripts/check_local.py --core <本地-YGL-Core-源码目录>
 ```
 
 将 `dist/` 中生成的 ZIP 通过本机 AstrBot 的插件安装入口上传。单元测试使用独立样例验证发现、匹配、消息与打包。SDK 检查使用上面的三条真实上游指令，核对原神 JPEG、鸣潮完整文本、星铁别名和停用重载行为。给检查脚本加上 `--list-commands` 可查看当前候选实际注册的服务、触发方式和前缀要求。该选项只列注册项；需要公开数据或外部素材的查询仍取决于数据是否可用。WebChat 实收需单独验收。
 
-回退时，通过同一个安装入口上传预先保留的本机旧版 ZIP，并保留旧包绑定的私有解释器与内容寻址归档。停用 DLC 可撤下其全部路由。
+回退时，通过同一个安装入口上传预先保留的本机旧版 ZIP。旧包直接使用构建时写入的解释器、worker 和源码归档路径。请保留这些文件及解释器依赖的基础 Python，含早期版本使用的 `.sayu-local/<profile>/venv`。停用 DLC 可撤下其全部路由。
 
 外壳沿用 yomihime 的 Steam DLC 生命周期实现，采用 AGPL-3.0。三个上游的许可证随各自的源码快照保存。

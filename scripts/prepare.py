@@ -2,11 +2,9 @@
 
 import argparse
 import json
-import os
-import subprocess
-import venv
 from pathlib import Path
 
+from environments import prepare_environment
 from snapshot import fetch, pinned_snapshot, repository_path
 
 
@@ -23,23 +21,7 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     fetch(repository_path(directory, spec), spec)
     pinned_snapshot(directory, spec, directory.parent / "runtime")
-    env = directory / "venv"
-    if not env.exists():
-        venv.EnvBuilder(with_pip=True).create(env)
-    exe = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    subprocess.run(
-        [
-            str(exe),
-            "-I",
-            "-m",
-            "pip",
-            "--require-virtualenv",
-            "install",
-            "-r",
-            str(ROOT / "profiles" / f"{key}-requirements.txt"),
-        ],
-        check=True,
-    )
+    print(prepare_environment(directory, ROOT / "profiles" / f"{key}-requirements.txt"))
 
 
 if __name__ == "__main__":

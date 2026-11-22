@@ -19,6 +19,12 @@ class Assets:
         self.fetched = set()
         self.private_json = set()
 
+    def begin_invocation(self):
+        if self.public is not None:
+            self.public.attempted.clear()
+        if self.index is not None:
+            self.index.begin_invocation()
+
     def contains(self, candidate):
         return candidate.is_relative_to(self.root) or (
             self.data_root is not None and candidate.is_relative_to(self.data_root)

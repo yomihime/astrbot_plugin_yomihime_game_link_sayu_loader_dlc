@@ -9,6 +9,47 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from snapshot import file_digest, pinned_snapshot, safe_name, write_snapshot
+from environments import prepare_environment, selected
+
+
+class EnvironmentTest(unittest.TestCase):
+    def test_changed_dependencies_keep_previous_runtime_runnable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp)
+            lock = profile / "lock.txt"
+            executables = []
+            for version in ("1", "2"):
+                name = f"fixture-{version}.dist-info"
+                wheel = profile / f"fixture-{version}-py3-none-any.whl"
+                with zipfile.ZipFile(wheel, "w") as bundle:
+                    bundle.writestr("fixture.py", f"VERSION = {version!r}")
+                    bundle.writestr(
+                        f"{name}/METADATA",
+                        f"Metadata-Version: 2.1\nName: fixture\nVersion: {version}\n",
+                    )
+                    bundle.writestr(
+                        f"{name}/WHEEL",
+                        "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                    )
+                    bundle.writestr(f"{name}/RECORD", "")
+                lock.write_text("--no-index\n" + wheel.as_uri(), encoding="ascii")
+                exe = prepare_environment(profile, lock)
+                self.assertEqual(selected(profile, lock.read_bytes())[0], exe)
+                self.assertEqual(prepare_environment(profile, lock), exe)
+                executables.append(exe)
+            self.assertNotEqual(*executables)
+            for exe, expected in zip(executables, (b"1", b"2")):
+                self.assertEqual(
+                    subprocess.check_output(
+                        [
+                            str(exe),
+                            "-IB",
+                            "-c",
+                            "from fixture import VERSION; print(VERSION)",
+                        ]
+                    ).strip(),
+                    expected,
+                )
 
 
 class SnapshotTest(unittest.TestCase):

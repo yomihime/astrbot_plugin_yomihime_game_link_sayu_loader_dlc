@@ -16,3 +16,6 @@ propcache==0.4.1
 starrail_damage_cal==4.6.0
 typing_extensions==4.15.0
 yarl==1.23.0
+APScheduler==3.11.3
+tzdata==2026.6
+tzlocal==5.4.5

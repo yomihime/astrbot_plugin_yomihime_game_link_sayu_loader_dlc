@@ -573,12 +573,13 @@ class Discovery:
 
 
 async def discover(
-    source: Path, plugin: str, *, skipped: Counter | None = None
+    source: Path, plugin: str, *, skipped: Counter | None = None, discovery=None
 ) -> tuple:
     """Register available upstream handlers. Incomplete dependency graphs stay inactive."""
     from sayu_compat import registration_scope
 
-    discovery = Discovery(Path(source).resolve(), plugin)
+    if discovery is None:
+        discovery = Discovery(Path(source).resolve(), plugin)
     callbacks = []
     candidates = []
     for module, path in discovery.paths.items():

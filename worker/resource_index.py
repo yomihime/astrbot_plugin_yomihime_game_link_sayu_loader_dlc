@@ -82,6 +82,9 @@ class ResourceIndex:
         self.dirs = set()
         self.remaining = MAX_BYTES
 
+    def begin_invocation(self):
+        self.remaining = MAX_BYTES
+
     def _load(self, path):
         path = Path(path)
         if (

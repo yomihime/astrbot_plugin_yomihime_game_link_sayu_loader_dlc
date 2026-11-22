@@ -24,6 +24,10 @@ def prepare(parts):
     return owner.prepare_owner_parts(parts, Path(__file__).parent, "fixture")
 
 
+def public(parts):
+    return owner.prepare_public_parts(parts, Path(__file__).parent, "fixture")
+
+
 def result_image(parts):
     (result,) = prepare(parts)
     return Image.open(BytesIO(base64.b64decode(result["image"])))
@@ -130,7 +134,7 @@ class OwnerPartsTests(unittest.TestCase):
         noise = Image.frombytes("RGB", (180, 160), Random(25).randbytes(180 * 160 * 3))
         parts = [{"text": "before"}, part(noise), {"text": "after"}]
         with patch.object(owner, "PUBLIC_BYTES", 45_000):
-            result = owner.prepare_public_parts(parts)
+            result = public(parts)
             self.assertEqual((result[0], result[-1]), (parts[0], parts[-1]))
             self.assertLessEqual(len(base64.b64decode(result[1]["image"])), 45_000)
             private = prepare([parts[1]])
@@ -140,9 +144,22 @@ class OwnerPartsTests(unittest.TestCase):
                 self.assertLess(image.width, noise.width)
                 self.assertGreaterEqual(image.width, noise.width // 2)
         with self.assertRaises(UnsupportedMessage):
-            owner.prepare_public_parts(
-                [{"image": base64.b64encode(b"bad image").decode()}]
-            )
+            public([{"image": base64.b64encode(b"bad image").decode()}])
+
+    def test_public_alpha_over_budget_keeps_visible_and_transparent_pixels(self):
+        from random import Random
+
+        raw = Image.frombytes("RGB", (160, 120), Random(1).randbytes(160 * 120 * 3))
+        frame = raw.convert("RGBA")
+        frame.paste((0, 0, 0, 0), (0, 0, 30, 30))
+        with patch.object(owner, "PUBLIC_BYTES", 23_000):
+            (result,) = public([part(frame)])
+        encoded = base64.b64decode(result["image"])
+        self.assertLessEqual(len(encoded), 23_000)
+        image = Image.open(BytesIO(encoded)).convert("RGBA")
+        self.assertEqual(image.size, frame.size)
+        self.assertEqual(image.getpixel((0, 0))[3], 0)
+        self.assertEqual(image.getpixel((80, 60))[3], 255)
 
     def test_animated_png_fails_without_sending_first_frame(self):
         first = Image.new("RGB", (3, 3), "red")
@@ -150,3 +167,26 @@ class OwnerPartsTests(unittest.TestCase):
         animated = part(first, save_all=True, append_images=[second], duration=30)
         with self.assertRaises(UnsupportedMessage):
             prepare([animated])
+
+    def test_public_multi_image_chain_is_complete_or_rejected(self):
+        parts = [
+            part(Image.new("RGB", (320, 40), "red")),
+            {"text": "between images"},
+            part(Image.new("RGB", (320, 60), "blue")),
+        ]
+        with patch.object(
+            owner, "worker_font", return_value=ImageFont.load_default(size=24)
+        ):
+            (result,) = public(parts)
+        with Image.open(BytesIO(base64.b64decode(result["image"]))) as image:
+            self.assertEqual(image.getpixel((320, 0)), (255, 0, 0))
+            self.assertEqual(image.getpixel((320, image.height - 1)), (0, 0, 255))
+            self.assertEqual(
+                image.crop((0, 40, 640, image.height - 60)).convert("L").getextrema(),
+                (0, 255),
+            )
+        tall = part(Image.new("RGB", (320, 641), "red"))
+        with self.assertRaises(UnsupportedMessage):
+            public([tall, tall])
+        with self.assertRaises(UnsupportedMessage):
+            public([parts[0], {"image": "bad"}])
