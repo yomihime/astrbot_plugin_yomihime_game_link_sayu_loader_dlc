@@ -1,0 +1,119 @@
+# Sayu 插件契约基线
+
+原生参照固定为 Genshin-bots/gsuid_core 的 `96cd7353be3100ff982bccc33e554961837c778e`。插件版本见 `profiles/lock.json`。选择这个提交是为了同时得到实现、锁文件和上游回归测试。该选择不代表三个插件曾针对同一版 Core 适配。[参考源码、文档及测试](https://github.com/Genshin-bots/gsuid_core/tree/96cd7353be3100ff982bccc33e554961837c778e)
+
+## 如何核查范围
+
+用支持 Python 3.13 语法的解释器运行 `python scripts/contract_inventory.py <原生源码根目录>`。脚本校验参考包全部 756 个 Python 文件的 Git blob 集合，从中列出模块、函数、方法、类型、字段和导入，再标出三个固定插件的显式导入，以及有同源对照的接口所对应的脚本。缺少逐项证据的符号保留为 `unverified`。固定基线的扩展扫描产出 23,816 行声明，包含重载、条件导入、异常分支、特殊方法及再导出。清单也保留了三款插件显式导入的下划线名称，以及有对照的私有方法。例如两款游戏直接导入的 `_MysApi` 与其请求基类的方法分别列项。256 行关联了指定输入的对照脚本，其余 23,560 行保留为待验证。行数不能衡量兼容率。动态导入、继承方法、装饰器生成的接口和消息时序需要行为测试。上游 tests 中的契约与实际插件调用用于为下面各行挑选样本。
+
+同一脚本加 `--contracts` 会为每个符号生成一行 JSON，列出固定版的调用签名或类型、上游文档摘要（如有）、源文件及行号、三个插件的显式引用、对应对照脚本和仍然存在的行为差异。`sampled` 表示已有指定输入的双端验证，`unverified` 保留给缺少逐符号对照的项。对没有文档的接口，可按源位置检查原生实现。两种输出都只读取源码，无需加载原生服务。
+
+### 当前用户的账号记录
+
+固定版的 `GsUser`、`GsUID` 和插件声明的 `User` 子类通过 Loader 的 SQLite 会话执行。显式私聊 `account` 命令获得当前插件、当前适配器及当前发送人的文件。Loader 在等待 worker 后重新核对宿主签发的调用对象；普通查询、群聊、其他用户及延迟任务均无法取得同一记录。读取旧文件时会核对实际列、表类型、主键、触发器和已有行的用户字段。用户内的绑定和取消绑定保留上游回调以及原生返回值。
+
+| 原生接口或行为 | 已对照 | 尚未覆盖 |
+| --- | --- | --- |
+| `cookie_manager.add_ck` 处理输入与绑定角色 | 用 8 份合成 Cookie 对照账号字段优先级、空值、可留存字段及序列化顺序，8 组角色输入核对区服或异常。四款游戏的绑定元组在初始、写入和重开后相同。私聊内的原版添加回调和 deal_ck 已对照无绑定、格式错误的输入及状态卡 | 凭据交换和服务端角色确认仍待接通可信签发方 |
+| `draw_add_ck_pic` 和 `_deal_ck_to_pic` 的账号状态卡 | 用六组非敏感状态文字，核对成功计数、800×260 画布的 RGBA 像素及默认 JPEG 的全部编码字节。四种暗色及模糊背景组合和两种状态图标也双端一致 | 此项验证录入后的状态显示，账号是否已获外部服务授权须另验 |
+| `BaseMysApi` 的账号设备字段 | 5 个合成输入核对海外设备 ID 及其指纹。已有账号首次读取空设备 ID 时，两端均生成 UUIDv4 并更新该角色的重复记录。之后读取复用原值，空字符串保留。Loader 另测了进程重开与四次并发首次读取 | 两端对无记录角色的两次读取分别返回独立的临时 UUIDv4，不创建记录。其他用户及适配器也无法凭此读取原账号或发起角色 GET。外部签发的设备认证仍待验证 |
+| 已存凭据的角色 GET 首次发送 | 给同一玩家写入合成 Cookie、指纹及空设备 ID。原生 aiohttp 与 Loader httpx2 实际发出的设备头均等于本地首次保存的 UUID。再次请求复用此值，显式保存空字符串后两端请求都带空设备头 | 固定接口使用 `ds_mode="none"`。Loader 在写入前复核角色和凭据，换绑、复用主键、轮替凭据已有交错测试。需要外部服务产生指纹的路径尚未接通 |
+| `Bind` 的 UID 列表、切换、解绑、绑定组和省略平台参数 | `scripts/binding_contract.py` 在两个进程之间重开数据库；`scripts/upstream_account_contract.py` 执行三款插件注册的绑定回调 | 不同 profile 之间共享原生全局绑定库 |
+| `GsUser`、`GsUID` 的按人、按 UID、按游戏查询和更新 | `scripts/orm_contract.py` 比较来源平台、UID 别名、Cookie/Stoken 选择、更新、删除及删除后查询 | 批量迁入真实账户、跨所有者管理及撤销外部登录 |
+| `GsBind.select_data` 返回的绑定记录 | 在原有 SQLite 绑定文件上核对了同一组 11 个字段、行主键、SQLModel 的字典和 JSON 序列化、显式字段集合及 SQLAlchemy 的分离状态。返回的记录是当前 profile 公开的 `GsBind` 实例；改动读出的对象后再次查询，数据库仍保留原值。空构造和跨进程重开也有双端对照 | 绑定记录继续使用该 profile 的隔离数据库。直接把返回对象附加到调用者自建的写会话、写入额外账号字段、以及完整原生映射继承关系未验证 |
+| `GsBind.select_data_list(user_id, bot_id)` | 指定当前用户及适配器时，未绑定返回 `None`，已绑定返回含一条分离 SQLModel 记录的列表。使用两名用户、两个适配器，对照了原生字段、修改返回对象后的重新读取和跨进程重开 | 省略 `bot_id` 时，原生可读取该用户在多个适配器的记录。Loader 仅查询当前投递所属适配器。跨用户、跨适配器及失效调用均被拒绝 |
+| 个人刷新 `get_ck_by_stoken` / `refresh_ck_by_uid_list` | 原生私聊回调对照零 UID、单个无 Stoken、多个游戏 UID 及格式错误的凭据。两边的跳过数、错误 UID、消息文本及 SQLite 重开结果一致。Loader 对整批 UID 先核对所有者及绑定 | 有效 Stoken 触达受信签发边界。原生在受控服务请求设备指纹和账号交换，当前 Loader 无法完成此交换。全局刷新需要管理员授权 |
+| `Cache` / `GsCache` 凭据缓存 | 固定 SQLModel 在两端核对按角色缓存、读取、定向刷新、唯一约束失败后的回滚及下一次写入。Loader 在插入和有结果的读取时核对当前用户、适配器、角色及凭据。定向刷新在当前用户及适配器的私库内按角色删除，也可清理孤立的旧缓存。旧库新增表后保留原用户记录 | 原生 `delete_error_cache(GsUser)` 在样本中返回真并保留失效记录，`delete_all_cache` 则清空缓存且重置用户的 `limit30` 状态。两种跨表管理调用在普通私聊均明确拒绝，已核对两表原值 |
+| `BaseMysApi.endpoint_request` 使用本地账号记录 | 同一合成记录实际进入两侧 HTTP 客户端，核对 GET 目标、查询、应用请求头和业务字段；设备描述字段残缺时两侧均在发包前抛出 `IndexError` | 该条回归使用原生 `ds_mode="none"`。需要签名的长期会话仍需受信请求授权。凭据查找不能证明外部游戏账户所有权 |
+| 鸣潮 `WavesUser` 与 `WavesBind` | 原版添加、刷新、获取和删除回调写入独立库。在外部 API 边界返回受控响应后，检查持久化行、主凭据与二级凭据的用途、身份拒绝和失败后的状态 | 真实账号、线上登录、网络重试与游戏服务可用性 |
+| `BaseMysApi.get_ck/get_uid` 和同一用户的多账号 | 7 组 UID 或别名各测 5 项读取，并验证 9 项区服、失效与恢复分支。已知角色的失效 Cookie 可从当前用户、适配器私库中的合格账号选取 | 陌生 UID 在原生可能得到全局候补；Loader 返回空。缺失角色 ID 会匹配原生别名表的空列，Loader 拒绝该输入。候补查询不授予向其他账号发送凭据的权限 |
+| `gsuid_core.utils.api.mys.api`、`gsuid_core.bot.call_bot` | 固定版本的 84 个端点和字符串常量逐项对照。插件可观察的区域、缺失区域错误及从归档导入的类型身份已检查。插件回调内可找到最近的 Bot 参数，两个并发调用各自取回自己的 Bot | 端点声明本身不授予联网权限；脱离调用栈的任务不能沿用先前的 Bot |
+| 已确认的只读 GET 连接失败、无效 JSON 和消息顺序 | 两端都经真实 `GsUser.insert_data` 写合成记录，并使用 `ds_mode="none"`。`scripts/mys_read_error_contract.py` 执行带 Bot 的回调，核对首次通知、再次请求、两次失败返回 `-999`、随后恢复及无 Bot 时的异常 | 取消、权限拒绝、响应超限与结果不明时不重放。空白正文在原生默认日志处理引发 `KeyError`，Loader 返回 `ValueError`。完整 JSON 字面值 `null` 在原生同样为日志 `KeyError`，Loader 在结果解析时报 `TypeError`。这两类差异均有单独断言 |
+| Worker 取消与重载 | `tests/test_module_worker_recovery.py` 经真实子进程管道区分发送前取消、开始写入后结果不明及停用，核对下一次调用和 Windows 子进程退出 | 测试覆盖确定的挂起和退役时序；没有穷举任意插件的后台任务 |
+
+### 三个固定插件的账号调用点
+
+下列入口取自固定提交。相同输入下的原生与 Loader 运行记录由 `scripts/upstream_account_contract.py` 生成。
+
+| 原版插件 | 入口 | 实际调用与核对范围 |
+| --- | --- | --- |
+| StarRailUID 0.2.0 | 绑定与解绑（同一回调） | `send_link_uid_msg` 调用 `GsBind.insert_uid`、`delete_uid`，按事件提供用户、适配器、群及游戏。重复绑定和两个发送者的结果已作双端对照。 [固定源码](https://github.com/baiqwerdvd/StarRailUID/blob/739a80a26b7a137b6b7b7d45435c769822de06d0/StarRailUID/starrailuid_user/__init__.py#L47) |
+| StarRailUID 0.2.0 | 已绑定账号的状态查询 | 先从 `GsBind.get_uid_list_by_game` 读取当前账号，再用 `GsUser.get_user_cookie_by_uid` 取凭据。读取绑定已核对；合成会话的完整状态查询仍在受信请求证明处停止。 [固定源码](https://github.com/baiqwerdvd/StarRailUID/blob/739a80a26b7a137b6b7b7d45435c769822de06d0/StarRailUID/starrailuid_stamina/draw_stamina_card.py#L111) |
+| GenshinUID 6.4.0 | UID 管理 | `send_link_uid_msg` 使用原生的绑定、切换和删除接口。当前用户的重复、解绑和持久化均在冻结 worker 的真实回调中核对。 [固定源码](https://github.com/KimigaiiWuyi/GenshinUID/blob/319b13465a60f96a2db2d5d569ca6a15128a9f2f/GenshinUID/genshinuid_user/__init__.py#L44) |
+| GenshinUID 6.4.0 | 树脂查询 | 原包从绑定行取 UID 列表。测试向两端提供相同的个人记录与受控角色响应，原生有树脂结果，Loader 的签发边界明确拒绝。 [固定源码](https://github.com/KimigaiiWuyi/GenshinUID/blob/319b13465a60f96a2db2d5d569ca6a15128a9f2f/GenshinUID/genshinuid_resin/draw_resin_card.py#L101) |
+| XutheringWavesUID 3.8.1 | 会话录入及刷新 | `add_cookie` 根据外部角色列表调用 `WavesUser` 的查找、插入或更新，并更新 `WavesBind`。同一文件的刷新路径调用 `WavesUser.select_data_list`。外部角色服务在账号契约测试中使用受控响应，两种游戏角色和两个独立用户的实际 SQLite 行均可检查。 [固定源码](https://github.com/Loping151/XutheringWavesUID/blob/7248f8cda8aa3164aca560e145e306a829e3c49d/XutheringWavesUID/wutheringwaves_user/deal.py#L161) |
+| XutheringWavesUID 3.8.1 | 凭据删除 | 原包调用 `WavesUser.delete_cookie`，传入 UID、发送者、适配器及游戏 ID。返回正文和删除后数据库均纳入账号对照。 [固定源码](https://github.com/Loping151/XutheringWavesUID/blob/7248f8cda8aa3164aca560e145e306a829e3c49d/XutheringWavesUID/wutheringwaves_user/deal.py#L252) |
+
+插件 ORM 的个人显示偏好端口按当前 profile 的清单授权。只有声明为 `write`、隐私下限为 `owner` 的能力，才能在当前投递任务中写入当前用户和适配器的独立 SQLite 文件。端口接受插件自己直接声明的 `BaseIDModel`，要求整数主键 `id`、唯一文本 `user_id`，其余列只能是表示界面语言的文本 `lang`、`language` 或 `locale`。其他用户设置、群组或账户字段需要独立的数据域或明确的结构授权。测试使用原样的鸣潮语言模型及另一插件的 `ReaderSettings.locale`。
+
+插件自有的 `Bind` 子类可以用同一次私有投递获得的数字 UID 授权，读写当前用户与适配器在原表中的绑定。表须具备原生身份列，其余列仅接受 `uid` 和 `<游戏>_uid`，每个 UID 由 1 至 32 位 ASCII 数字组成，前导零与列表顺序均保留。旧绑定的群关联只能原样保留。带凭据列、额外业务列或与声明不符的实际表结构需要独立授权。`scripts/orm_contract.py` 对照了上游鸣潮的首次绑定、重复、切换、删除和跨代重开，也覆盖另一插件自定义的 `ebook_uid`。
+
+## 接口与对照测试
+
+| 接口及行为 | 原生预期和定位 | DLC 实现与缺口 | 对照测试或尚需补的样本 |
+| --- | --- | --- | --- |
+| 包加载、启动和关闭 | `server.GsServer.load_plugin/cached_import` 解析目录及元插件，执行包代码。启动前、启动、关闭分别调度，优先级分组、组内并发 | 普通包按代际启动。三个游戏执行各自完整快照中的包入口及子模块。每个子模块分别记录成功或异常并保留原生的继续加载行为。同代元插件的发现、API 名称绑定、缺失及注销已对照，跨 profile 的依赖需要宿主授权 | 同一 `contract_probe` 插件，两次启动和停用，同进程模块变量及隔代文件计数 |
+| 服务与触发器 | `sv.Plugins/SV/SL` 管理前缀、开关和触发器。原生 `trigger.dispatch_sort_key` 比较前缀、服务优先级、类型和部分类型的关键词长度，`block` 截断后续处理 | worker 注册表与调用排序；受信适配器的文件及元事件已通过实际回调验证，真实 WebChat 仍只传宿主公开的消息视图 | `cporder`、相同优先级的关键词、近似命令、同名装饰器；参照 `tests/test_handler_and_triggers.py` |
+| 身份与授权 | `handler.msg_process/get_user_pml/_sv_authorized` 区分用户、群、机器人账号、角色和权限，服务以及插件分别有允许/排除名单 | 入口沿用 YGL 权限；可提供的身份字段受 SDK 限制，普通权限样本不代表管理员或群员角色 | `cpinspect payload`、受限服务、普通用户、拒绝冒充管理员；仍需真实宿主签发角色 |
+| 模型、消息段、发送 | `models.Event/MessageReceive/MessageSend`、`segment.MessageSegment`、`bot.Bot.send` 支持有序消息、异步队列、不同段和返回记录 | 当前调用可返回文本或一张承载有序图文的卡片。原生多次发送的分帧、返回记录、回复引用、撤回和流式输出需宿主支持 | 对比分段边界、张数、像素、接收次序和错误；参照 `tests/test_bot_and_models.py` |
+| 跨消息状态、数据目录 | `data_store.get_res_path` 创建目录，模块变量随进程存活，文件可跨启动 | 每个 profile 独立持久目录，代际内复用 worker。限定路径在插件目录内。账号、配置及玩家数据不能共用实例目录 | 同用户连续调用、重载、越界路径；需补多用户并发及数据库事务 |
+| 调度 | `aps.scheduler` 使用 AsyncIOScheduler，时区 Asia/Shanghai，支持 interval、cron、date、查询、移除任务和 misfire 策略 | 代际负责调度器的启动与退役。后台主动投递取决于独立的宿主权限 | 已比较任务排序、同名去重、增删改、暂停和恢复。`scripts/scheduler_timing_contract.py` 核对了四组积压与错过执行的八个事件。旧周期任务停用后新增触发 0 次，正在运行的同步回调在两端都可能完成 |
+| 配置 | `utils.plugins_config.models/gs_config.StringConfig` 有命名实例、类型、缺省值、模板调和、路径迁移和修改落盘 | 已接入常用标量、字符串列表、字典、图片配置，支持隔离文件读写。已加入原生带类型标记的配置模型；定时刷写、配置管理器与旧格式迁移仍需逐项对照 | `scripts/config_contract.py` 双端运行同一事务，比较初值、错型、缺项、同名身份、磁盘 JSON、路径迁移 |
+| 账号、数据库与外部 API | `utils.database.models/base_models` 提供绑定、会话、事务和授权。游戏 API 单独依赖服务 | 五个透传入口均在 YGL 声明为仅命令可调用的写操作。上游命令可以更改本 profile 的个人设置。写绑定和读取账户清单分别需要受信授权，授权限定到 profile、适配器、用户及当前投递 | 已对比选取、切换、重复绑定、删除与跨进程重开。管理员查询在合成记录上比对了 19 组结果，普通聊天的配置卡保留权限差异。见 [整包对照](package-oracle.md) |
+| 多轮交互、文件 | `Bot.receive_resp/receive_mutiply_resp/send_option` 等待特定会话、超时、清理；`SV.on_file` 接收适配器文件段 | 当前 YGL 命令只附带文本与事件引用，无法提供完整原始文件或未匹配命令的后续应答 | 内存适配器已对照单用户和多人回复；超时、停用取消、宿主文件句柄与过期仍待接通 |
+| 指定目标发送与订阅 | `Bot.target_send/unsend/ban`、`subscribe` 绑定目标、平台能力及发送回执 | SDK 提供受控的订阅和任务接口，缺少插件可调用的通用目标投递、撤回或禁言授权。不得从字符串目标重建授权 | 已在内存目标核对两帧目标、文本及文件字节；真实回执、撤销、过期与部分成功待验证 |
+| 插件管理 | `Plugins.set`、`SV.set/enable/disable`、`GsServer`、`utils.plugins_update` 涉及服务路由、发现、安装和管理权限 | 同一 profile 的启用状态、优先级、前缀与插件别名可持久化。包初始化或隔离管理夹具可写，普通聊天、退役任务和其他 profile 无权修改。YGL 管理 DLC 的启用退役。宿主管理接口及跨插件广播排序仍待宿主支持 | 普通与强制前缀、空前缀、注册快照、下一条消息的排序及重载后声明覆盖均有双端对照 |
+| 工具、图片和资源 | `i18n`、`logger`、`pool`、`utils.image`、`help`、`download_resource`、模板及上传 API 有独立格式、日志、缓存和错误语义 | 部分图片/数据和公开素材适配已用于实际查询。已对照语言资源、日志诊断、帮助绘图及受控下载；上传与在线账号仍有缺口 | 输入缺失、损坏图片、限额、下载失败、语言切换；用真实游戏原回调校验 |
+| 扩展面 | `ai_core` 的 hooks、kits、tools，`webconsole`、HTTP 服务、消息历史等提供额外可调用接口 | 已验证禁用 AI 的注册行为和进程内 ASGI 应用。启用 AI 的工具调用、线上管理及共享的消息历史仍有缺口 | 原生 `tests/test_agent_hooks_registry.py`、`tests/test_tool_registry.py` 和 `docs/HTTP_AGENT_API.md`；从无副作用的注册与注销开始 |
+
+逐模块成功数、异常归因、解释器条件和输入对照方法见[三个固定整包的原生对照](package-oracle.md)。
+
+## 需要 YGL 公共接口的部分
+
+按原生可见行为、YGL 0.2.11 已有能力、最小扩展及验收方式展开的设计见[宿主公共接口缺口](ygl-host-ports.md)。
+
+1. 给每次调用签发不可伪造的会话与角色视图，包括适配器、机器人身份、是否群聊及权限判定结果。公开的 `InvocationView` 本身不授予权限，普通聊天不保证有 `conversation_kind`。需要宿主执行授权并支持撤销，以便区分管理员和普通用户。
+2. 增加一组绑定到调用或已授权订阅的发送操作，明确顺序、消息边界、部分失败、真实投递状态及只可在相应目标内使用的消息引用。`CapabilityResult` 只能描述本次计算给出的文档。资源已入缓存无法证明用户收到了每个消息段。
+3. 为会话等待者提供可取消的事件订阅，将文件、引用消息和应答封装成带期限的读取句柄。代际变化、授权撤销、超时后失效。`MessageAccess.read` 的文本和事件引用不足以还原这些输入。
+4. 为可管理的操作提供能力清单和目标级授权，将自身服务开关与跨模块管理分开。YGL 保留模块启停及账号权限控制，DLC 不操作共享数据库、宿主重启或其他模块。
+
+5. 现有 `AccountOperations` 支持绑定、状态及撤销。插件侧涉及会话凭据的请求，还需要宿主将用户、适配器、操作、有效期和目标服务绑定为一次可撤销的请求授权。隔离测试已对照受控外部 HTTP 的请求与响应，真实账号接线须由宿主签发授权。
+6. 原生进程池执行需要在子进程中继续约束包摘要、数据目录、网络和权限。当前可用的是按代际关闭的 10 线程池，`to_process` 调用会报告缺少隔离子进程。启用 AI 的模型调用也需要明确的提供方权限与请求生命周期。
+
+## 复现对照
+
+将固定 GsCore 提交检出到独立目录，以其 `uv.lock` 安装独立测试解释器。Loader 使用自己构建的私有解释器。运行原生用例前，脚本将固定 Git 清单中的文件校验并复制到临时目录。凭据、共享数据库、外部适配器和启动中的 GsCore 服务均无需参与对照。
+
+| 可执行检查 | 实际观察与判定范围 |
+| --- | --- |
+| `python scripts/loader_contract.py --core <YGL源码> --python <Loader解释器> --output <loader.json>`，然后用原生解释器执行 `scripts/native_contract.py --reference <GsCore源码> --output <native.json> --compare-loader <loader.json>` | 同一插件，两个代际，13 次输入。12 项共享结果相符。三次状态回复为 `1/1`、`2/2`、`1/3`。顺序为 first、second，阻断第三个回调。两边记录受控异常，下一条命令仍可用。停止后定时器安静。普通用户拒绝管理命令；配置的原生 master 被允许，Loader 缺少宿主签发的同等身份，拒绝同名用户。比较保留了这项差异。 |
+| 用两端解释器分别执行 `scripts/config_contract.py --output <结果.json>`，原生侧另加 `--reference <GsCore源码>` | 初值、修改、类型拒绝、缺项、迁移、磁盘及实例身份的观察结果相同。 |
+| 用原生测试解释器执行 `scripts/binding_contract.py --reference <GsCore源码> --output <结果.json>` | 同一组 UID 插入、重复、选取和切换、删除、群字段及跨进程重开，在隔离数据库上结果一致。Loader 另测公共入口、错误用户、适配器与空身份拒绝。 |
+| 用原生测试解释器执行 `scripts/service_contract.py --reference <GsCore源码> --output <结果.json>` | 同一插件的服务停用、重新启用、插件级开关及重开后的选择一致；对没有权限的用户和过期上下文仍拒绝。 |
+| 用原生测试解释器执行 `scripts/sv_routing_contract.py --reference <GsCore源码> --output <结果.json>` | 比对两次全新进程中的注册与真实分发。已有触发器保留注册时的前缀，新触发器采用当时生效的设置。只有跨插件竞争一项使用原生侧的两个测试插件。 |
+| 用原生测试解释器执行 `scripts/target_contract.py --reference <GsCore源码> --output <结果.json>` | 内存收件器收到两个顺序一致的目标帧、文本及非 UTF-8 附件。单用户与多人应答的用户和文本相符。生产端没有这项授权时，显式拒绝调用。 |
+| `scripts/audit_package_init.py --writable-source --lifecycle` | 使用完整固定源码、空私有数据目录及正式 worker 包。逐模块报告注册、导入异常、迁移及启动日志。上游捕获的下载失败在日志中单独记录。 |
+| `layout_contract.py`、`trigger_contract.py`、`message_contract.py` | 目录、嵌套、单文件等六种布局；触发器排序及匹配；比较事件字段、会话身份、按钮、文件和消息段构造。 |
+| `orm_contract.py`、`gss_contract.py`、`subscribe_contract.py`、`backup_files_contract.py` | 隔离数据库的重开、事务与迁移，活动连接、订阅目标及顺序，私有备份恢复及越界拒绝。 |
+| `mys_account_contract.py`、`mys_models_contract.py`、`mys_cache_contract.py`、`minigg_contract.py`、`public_api_contract.py` | 测试身份、请求编码和返回值，类型模型、缓存以及公开游戏数据。替身只代表这些数据与请求条件。 |
+| `app_life_contract.py`、`ai_contract.py`、`core_config_log_contract.py`、`image_tools_contract.py`、`help_contract.py`、`resource_download_contract.py` | 进程内 ASGI、禁用 AI 配置、诊断、图像、帮助及授权资源。外部 HTTP 端点及启用 AI 的运行结果仍需独立验证。 |
+
+完整插件端契约还包括输出错误的传播方式。原生参考把处理器异常写入错误报告；Loader 将该错误返回 YGL。定时器对照验证了运行与停止，未要求两端恰好触发相同次数。文本和图片在 WebChat 中也可能被 YGL 合成为一条回复，原生发送帧和最终收件要分别核验。
+
+## 历史声明模式的 WebChat 验收记录
+
+在本机 YGL Core 0.2.11、三个声明模式模块同时启用的条件下测试。第一次集成时，原神查询因为适配器日志帧没有接收端而退出。为此增加了代际内有界的日志通道；宿主清单只显示各级别计数。修复后，原三条指令分别收到三月七别名图、伤害乘区图和完整抽卡指南。停用组三路均返回模块不存在；重载组每条收到一次业务结果。实际重新安装上一轮包后，三路仍可使用旧包绑定的依赖完成查询。
+
+首个冻结候选的三条新样本保持原判。星铁 `sr角色图鉴 姬子` 下载到了正确的原图，卡片的透明 PNG 在最小可读尺寸仍超出编码预算，未送达。原神 `gs查委托望舒须筑阶` 的四项攻略内容正确，但换行被宿主压平，没有满足预登记的四行格式。鸣潮 `ww菜单` 返回含横幅、绑定示例、业务分类和六个命令选项的完整目录图。修复采用支持透明度的调色板编码以及按公开宿主接口投递多行文本；这些已见样本仅作为后续回归。
+
+最终候选的真实回归保留了十个三月七别名、原神原图及选项，以及鸣潮抽卡指南的全部 868 字和 45 行。前次盲测的姬子图鉴、四行望舒委托、鸣潮菜单均重新实收成功。
+
+| 最终候选独立新样本 | 实际收件和归因 |
+| --- | --- |
+| `sr角色攻略 布洛妮娅` | 收到角色攻略图，图中有布洛妮娅立绘、光锥、遗器、行迹及配队。 |
+| `gs角色资料 香菱` | 未收到资料。Loader 缺 `get_character_info`，在发请求前失败。固定原生实现使用受控 HTTP 响应能输出九行资料；原生另测真实 MiniGG 端点时出现连接错误。 |
+| `ww散华共鸣链` | 未收到图。解析到了角色 1102，声明加载器在链接绘图回调时拒绝异常日志中的 `type(e).__name__`。在隔离导入环境中，相同上游处理函数使用原模型、字体和素材，经 PIL 分支生成 1000×1996 的六段共鸣链图，冻结候选的输出接口能接收这张图。此对照只覆盖该绘图路径。 |
+| `gs版本规划 5.0`（补抽） | 收到完整的 900×2689 原石统计图及两个选项。收件图的原图区域与固定上游原图逐像素一致。 |
+| `ww无冠者介绍`（补抽） | 未收到声骸图。处理器进入声骸 PIL 分支后，声明加载器在构建上游 `EchoModel` 时拒绝了 `float(v).is_integer()`。已定位首个 Loader 阻塞点；该分支的原生完整输出待验证。 |
+
+最终冻结包的 SHA-256 为 `d72be5f651fd8dad42c439d0800074aba44a6a58a1834cc551c417ed0ff93646`。五个新样本收到两项正确业务结果。此收件记录只绑定该历史候选。

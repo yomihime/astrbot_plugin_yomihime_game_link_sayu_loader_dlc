@@ -1,0 +1,3 @@
+# Type and endpoint declarations are byte-verified against the pinned source tree.
+[format]
+exclude = ["api.py", "models/**/*.py"]

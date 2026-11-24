@@ -1,0 +1,35 @@
+{
+  "starrail": {
+    "directory": "StarRailUID",
+    "repository": "baiqwerdvd/StarRailUID",
+    "commit": "739a80a26b7a137b6b7b7d45435c769822de06d0",
+    "version": "0.2.0",
+    "package": "StarRailUID",
+    "module_id": "sayusr",
+    "prefix": "sr",
+    "runtime_mode": "package",
+    "snapshot_sha256": "3bc706aa7eab83f83954e43bda7ebd5e5bcc725c40083d090567df8109e0ac5b"
+  },
+  "genshin": {
+    "directory": "upstream",
+    "repository": "KimigaiiWuyi/GenshinUID",
+    "commit": "319b13465a60f96a2db2d5d569ca6a15128a9f2f",
+    "version": "6.4.0",
+    "package": "GenshinUID",
+    "module_id": "sayugs",
+    "prefix": "gs",
+    "runtime_mode": "package",
+    "snapshot_sha256": "dbaeba58de5d486864ccfb3097d4e126714a9f5604edcdef7e5c92af59ccda0f"
+  },
+  "waves": {
+    "directory": "upstream",
+    "repository": "Loping151/XutheringWavesUID",
+    "commit": "7248f8cda8aa3164aca560e145e306a829e3c49d",
+    "version": "3.8.1",
+    "package": "XutheringWavesUID",
+    "module_id": "sayuww",
+    "prefix": "ww",
+    "runtime_mode": "package",
+    "snapshot_sha256": "42a5c78d063e412815204e0d28461429b206e60df10c716000f708ebb09074b2"
+  }
+}

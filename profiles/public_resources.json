@@ -1,0 +1,58 @@
+{
+  "GenshinUID": {
+    "published_images": {
+      "source_ids": "GenshinUID/GenshinUID/utils/map/data/icon2Name_mapping_6.4.0.json",
+      "origin_directory": "https://upload-os-bbs.mihoyo.com/game_record/genshin/equip",
+      "ledger": "genshin-equipment-icons.json",
+      "ledger_sha256": "61c75a8300ccc124ac10b77c52b7b05dffb9e578f0eef048f77a5f34c3ccef43"
+    },
+    "image_origins": [
+      "https://act-webstatic.mihoyo.com",
+      "https://enka.network",
+      "https://fastcdn.mihoyo.com",
+      "https://gi.yatta.top",
+      "https://img-static.mihoyo.com",
+      "https://upload-bbs.mihoyo.com",
+      "https://uploadstatic.mihoyo.com"
+    ],
+    "bulk_mirrors": []
+  },
+  "StarRailUID": {
+    "image_origins": [],
+    "bulk_mirrors": []
+  },
+  "XutheringWavesUID": {
+    "stream_object": {
+      "declaration": "XutheringWavesUID/XutheringWavesUID/utils/resource/download_all_resource.py",
+      "sha256": "8f5b5f0fffec35e3a90055ef7a7a3cec3ebf9817345d84ecf25c2655d8f74953",
+      "function": "check_speed",
+      "origins": "URL_LIB",
+      "url": "test_url",
+      "origin_parameter": "base_url",
+      "package_parameter": "plugin_name",
+      "object": "speedtest",
+      "mime": "application/octet-stream",
+      "bytes": 1048576
+    },
+    "sha256_manifest_directory": "resource/hash",
+    "image_origins": [
+      "https://prod-alicdn-community.kurobbs.com",
+      "https://web-static.kurobbs.com"
+    ],
+    "bulk_mirrors": [
+      "https://ww1.loping151.top",
+      "https://ww2.loping151.top",
+      "https://ww3.loping151.cn"
+    ],
+    "platform_indexes": {
+      "declaration": "XutheringWavesUID/XutheringWavesUID/utils/resource/download_all_resource.py",
+      "sha256": "8f5b5f0fffec35e3a90055ef7a7a3cec3ebf9817345d84ecf25c2655d8f74953",
+      "binding": "PLATFORM",
+      "resolver": "get_target_package",
+      "targets": {
+        "win-amd64/cpython-312": "win-x86_64-py3.12",
+        "win-amd64/cpython-313": "win-x86_64-py3.13"
+      }
+    }
+  }
+}
