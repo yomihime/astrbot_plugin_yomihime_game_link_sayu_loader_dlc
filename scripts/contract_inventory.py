@@ -136,6 +136,14 @@ def proof_index():
             "utils.database.base_models.User",
             "utils.database.base_models.with_session",
             "utils.database.startup.exec_list",
+            "utils.database.models.GsUID.get_main_uid",
+            "utils.database.base_models.BaseIDModel.base_select_data",
+            "utils.database.base_models.User.select_data_by_uid",
+            "utils.database.base_models.User.delete_user_data_by_uid",
+            "utils.database.base_models.BaseModel.update_data_by_uid_without_bot_id",
+            "utils.api.mys.base_request.BaseMysApi.get_uid",
+            "utils.api.mys.base_request.BaseMysApi.get_ck",
+            "utils.api.mys.base_request.BaseMysApi.get_stoken",
         ],
         "image_tools_contract": [
             "utils.image.image_tools." + name
@@ -249,6 +257,10 @@ def proof_index():
                     "get_uid_by_game",
                     "get_uid_list_by_game",
                     "update_data",
+                    "select_data",
+                    "bind_exists",
+                    "get_bind_group",
+                    "get_bind_group_list",
                 )
             ),
         ],

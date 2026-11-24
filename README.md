@@ -10,6 +10,8 @@ Sayu Loader 将上游的聊天服务接入 AstrBot 的 Yomihime Game Link（YGL�
 
 星铁和原神的 `query` 走 YGL 公开卡片。需要复制文本时，可在私聊中把 `query` 换成 `direct`。鸣潮的 `query` 沿用私聊投递。每个入口都由 YGL 校验调用权限。
 
+三款插件都支持私聊 `/ygl <路由> account <上游指令>`。例如 `/ygl sayuww account ww绑定UID000000731` 会由鸣潮原版回调处理。这个入口要求 Core 为当前命令提供已验证的私聊类型，账号数据按插件、平台和发送人分开保存。普通查询不能取得账号表的读取许可。插件账号库使用本机 SQLite 明文存储，WebChat 也会保存输入消息；现阶段账号验收使用合成测试数据。带认证的游戏请求和真实登录的覆盖范围见[账号契约](docs/plugin-contract.md)。
+
 ## 服务如何加载
 
 1. 原生参照为 GsCore 0.12.2 的 `96cd7353`。`profiles/lock.json` 固定三款插件的提交、完整 Git 文件树的归档摘要及包加载模式。快照包含外层目录、内层包、初始化文件和随包资源。
