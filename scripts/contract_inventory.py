@@ -272,8 +272,11 @@ def proof_index():
                 for name in (
                     "get_account_id", "get_cookie_value", "serialize_cookie",
                     "get_persist_cookie_data", "is_overseas_account", "get_all_bind_uid",
+                    "draw_add_ck_pic", "_deal_ck_to_pic",
                 )
             ),
+            "utils.image.image_tools.get_status_icon",
+            "utils.image.image_tools.get_v4_bg",
             *(
                 "utils.database.models.GsBind." + method
                 for method in (

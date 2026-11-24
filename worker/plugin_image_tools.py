@@ -12,7 +12,7 @@ import random
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from port_errors import Unsupported
 
@@ -42,6 +42,23 @@ def _asset(name):
     if raw is None:
         raise Unsupported(f"missing native image asset: {name}")
     return Image.open(BytesIO(raw))
+
+
+def get_status_icon(status):
+    return _asset("yes.png" if status else "no.png")
+
+
+def get_v4_bg(w, h, is_dark=False, is_blur=False):
+    # The pinned default_bg directory contains one image. The crop enforces
+    # the worker's input, canvas and intermediate resize budgets.
+    with _asset("bg.jpg") as background:
+        image = crop_center_img(background.convert("RGBA"), w, h)
+    if is_blur:
+        image = image.filter(ImageFilter.GaussianBlur(radius=20))
+    if is_dark:
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 180))
+        image.paste(layer, (0, 0), layer)
+    return image
 
 
 def _inside(path):
@@ -326,6 +343,8 @@ def install_image_tools(package, source_root, data_root, *, fetch=None):
     _fetch = fetch
     module = package("gsuid_core.utils.image.image_tools")
     for helper in (
+        get_status_icon,
+        get_v4_bg,
         crop_center_img,
         easy_alpha_composite,
         draw_text_by_line,

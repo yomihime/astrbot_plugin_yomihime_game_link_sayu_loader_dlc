@@ -92,6 +92,38 @@ async def account_input_probe():
     return {"cookies": cookies, "regions": regions, "devices": devices}
 
 
+async def account_status_cards():
+    from gsuid_core.utils.cookie_manager.add_ck import draw_add_ck_pic, _deal_ck_to_pic
+    from gsuid_core.utils.image.image_tools import get_status_icon, get_v4_bg
+
+    def pixels(img):
+        with img:
+            return (img.size, img.mode, hashlib.sha256(img.tobytes()).hexdigest())
+
+    backgrounds = [
+        pixels(get_v4_bg(96, 64, dark, blur))
+        for dark in (False, True)
+        for blur in (False, True)
+    ]
+    icons = [pixels(get_status_icon(value)) for value in (False, True, -1)]
+    cards = []
+    # Synthetic status messages only. Each item exercises the actual renderer
+    # and encoder from this runtime, including the exact 27-character boundary.
+    for message in (
+        "",
+        "请先绑定游戏角色",
+        "甲" * 27 + "\n" + "乙" * 26,
+        "甲" * 26 + "\n" + "乙" * 27 + "\n第三行",
+        "添加Cookies成功\n合成说明",
+        "添加Stoken成功\n合成说明\n添加Cookies成功",
+    ):
+        img, count = await draw_add_ck_pic(message)
+        encoded, encoded_count = await _deal_ck_to_pic(message)
+        assert count == encoded_count == message.count("成功")
+        cards.append((pixels(img), count, hashlib.sha256(encoded).hexdigest()))
+    return {"backgrounds": backgrounds, "icons": icons, "cards": cards}
+
+
 async def probe(mode, phase, worker):
     from native_contract import offline
 
@@ -125,6 +157,7 @@ async def probe(mode, phase, worker):
         result["account_input"] = await account_input_probe()
         result["roles_before"] = await get_all_bind_uid(BOT, ACTOR)
         if phase == "write":
+            result["status_cards"] = await account_status_cards()
             result["insert"] = [
                 await GsBind.insert_uid(ACTOR, BOT, value, "room", 9)
                 for value in ["0", "notnumber", "000000001", "000000002", "000000001"]
