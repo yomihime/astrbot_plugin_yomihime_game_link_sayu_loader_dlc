@@ -133,11 +133,14 @@ def proof_index():
             "segment.MessageSegment",
             "segment.process_buttons",
         ],
+        "sqlite_transaction_contract": [
+            "utils.database.base_models.with_read_session",
+            "utils.database.base_models.with_session",
+        ],
         "orm_contract": [
             "utils.database.base_models.Bind",
             "utils.database.base_models.BaseModel",
             "utils.database.base_models.User",
-            "utils.database.base_models.with_session",
             "utils.database.startup.exec_list",
             "utils.database.models.GsUID.get_main_uid",
             "utils.database.base_models.BaseIDModel.base_select_data",
@@ -359,6 +362,7 @@ PROBE_LIMITS = {
     "pool": "Generation-owned thread executor. Isolated subprocess execution remains open.",
     "inbound_adapter": "Compared controlled adapter frames. Production YGL lacks trusted raw frames and role grants.",
     "user_language": "Compared bound-user language and translation lookup. Other users require another grant.",
+    "sqlite_transaction": "Compared reads during a write, nested transactions, rollback, concurrent updates and reopening. First-savepoint rollback and cross-owner visibility differ.",
     "minigg": "Compared controlled external responses and errors. Live availability depends on the publisher.",
     "core_config_log": "Compared local configuration and logging. Host-wide configuration changes require host authorization.",
     "native": "Two generations of the same self-owned test plugin. Unexercised event shapes remain open.",
