@@ -4,3 +4,7 @@ class Unsupported(ValueError):
 
 class OfflineNetwork(PermissionError):
     """An isolated offline profile attempted a network operation."""
+
+
+class StartupTransferLimit(Unsupported):
+    """The generation's cumulative startup transfer window has expired."""

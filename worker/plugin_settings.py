@@ -9,8 +9,9 @@ from copy import deepcopy
 from datetime import date
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import pkgutil
+import shutil
 import tempfile
 from threading import RLock
 from types import MappingProxyType
@@ -20,6 +21,7 @@ import msgspec
 import plugin_config_models as schema
 from port_errors import Unsupported
 from service_settings import _grant
+from worker_storage import publish_new_config as _publish_new
 
 SCHEMA_SHA256 = "861bf9f73e650482f968a3e5343140a3dcd199c84572cd0b6883326ef676e833"
 MODELS = {t.__name__: t for t in get_args(schema.GSC)}
@@ -178,6 +180,22 @@ def configuration_type(root, plugin=None, *, registry=None):
         finally:
             pending.unlink(missing_ok=True)
 
+    def migrate_file(old, final):
+        _check_write()
+        final.parent.mkdir(exist_ok=True, parents=True)
+        try:
+            content = old.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return
+        with tempfile.NamedTemporaryFile(dir=final.parent, delete=False) as file:
+            pending = Path(file.name)
+        try:
+            pending.write_text(content, encoding="utf-8")
+            if _publish_new(pending, final):
+                old.unlink()
+        finally:
+            pending.unlink(missing_ok=True)
+
     class StringConfig:
         def __new__(cls, config_name, CONFIG_PATH, config_list):
             if config_name is None:
@@ -194,9 +212,7 @@ def configuration_type(root, plugin=None, *, registry=None):
                 if not final.exists():
                     for old in previous:
                         if old.is_file():
-                            _check_write()
-                            final.parent.mkdir(exist_ok=True, parents=True)
-                            os.replace(old, final)
+                            migrate_file(old, final)
                             break
                 self.CONFIG_PATH = final
                 self.config_name = config_name
@@ -347,6 +363,153 @@ def configuration_type(root, plugin=None, *, registry=None):
     return StringConfig
 
 
+def configuration_manager_type(root, string_config):
+    root = Path(root).resolve()
+    lock = RLock()
+
+    class ConfigSetManager:
+        def __init__(self, base_path, config_template, name_suffix=""):
+            self._base_path = Path(base_path).resolve()
+            if not self._base_path.is_relative_to(root):
+                raise ValueError("configuration set outside private profile")
+            self._config_template = config_template
+            self._name_suffix = name_suffix
+            self._cache = {}
+
+        def _get_config_path(self, config_name):
+            return self._base_path / f"{config_name}.json"
+
+        def _file(self, name):
+            if (
+                not name
+                or name in {".", ".."}
+                or any(char in name for char in "/\\:\0")
+                or (os.name == "nt" and PureWindowsPath(f"{name}.json").is_reserved())
+            ):
+                raise ValueError("configuration name must be a single path component")
+            base = self._base_path.resolve()
+            path = Path(self._get_config_path(name)).resolve()
+            if (
+                not base.is_relative_to(root)
+                or path == base
+                or not path.is_relative_to(base)
+            ):
+                raise ValueError("configuration outside managed directory")
+            if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+                raise ValueError("configuration path must be a private file")
+            return path
+
+        def _list_configs(self):
+            base = self._base_path.resolve()
+            if not base.is_relative_to(root):
+                raise ValueError("configuration set outside private profile")
+            if not base.exists():
+                return []
+            return sorted(
+                path.stem
+                for path in base.iterdir()
+                if path.suffix == ".json"
+                and path.is_file()
+                and self._file(path.stem).is_file()
+            )
+
+        def _create_string_config(self, config_name):
+            path = self._file(config_name)
+            if _writable():
+                path.parent.mkdir(parents=True, exist_ok=True)
+            return string_config(
+                f"{type(self).__name__}{self._name_suffix}_{config_name}",
+                path,
+                self._config_template.copy(),
+            )
+
+        def get_config(self, config_name):
+            with lock:
+                self._file(config_name)
+                if config_name in self._cache:
+                    return self._cache[config_name]
+                item = self._create_string_config(config_name)
+                if _writable():
+                    self._cache[config_name] = item
+                return item
+
+        def list_available(self):
+            return self._list_configs()
+
+        def get_all_configs(self):
+            return {name: self.get_config(name) for name in self.list_available()}
+
+        def exists(self, config_name):
+            return self._file(config_name).is_file()
+
+        def copy(self, source_name, new_name):
+            _check_write()
+            source_name = (source_name or "").strip()
+            new_name = (new_name or "").strip()
+            if not new_name:
+                return "名称不能为空"
+            if "+" in new_name:
+                return "配置文件名称不允许包含 '+' 字符"
+            if not source_name or source_name == new_name:
+                return "新名称与原配置相同"
+            with lock:
+                source = self._file(source_name)
+                if not source.is_file():
+                    return f"配置文件 '{source_name}' 不存在"
+                dest = self._file(new_name)
+                if dest.exists():
+                    return f"配置文件 '{new_name}' 已存在"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                pending = None
+                try:
+                    with (
+                        source.open("rb") as incoming,
+                        tempfile.NamedTemporaryFile(
+                            dir=dest.parent, delete=False
+                        ) as outgoing,
+                    ):
+                        pending = Path(outgoing.name)
+                        shutil.copyfileobj(incoming, outgoing)
+                    if not _publish_new(pending, dest):
+                        return f"配置文件 '{new_name}' 已存在"
+                finally:
+                    if pending is not None:
+                        pending.unlink(missing_ok=True)
+                self._cache.pop(new_name, None)
+            return None
+
+        def create_default(self, config_name):
+            _check_write()
+            with lock:
+                if config_name in self.list_available():
+                    return False
+                self.get_config(config_name)
+                return True
+
+        def delete(self, config_name):
+            _check_write()
+            with lock:
+                path = self._file(config_name)
+                try:
+                    path.unlink()
+                except OSError:
+                    return False
+                self._cache.pop(config_name, None)
+                return True
+
+        def drop_cache(self, config_name):
+            _check_write()
+            with lock:
+                self._cache.pop(config_name, None)
+
+        def clear_cache(self):
+            _check_write()
+            with lock:
+                self._cache.clear()
+
+    return ConfigSetManager
+
+
 def install_settings(package, data_root, plugin):
     raw = pkgutil.get_data(__name__, "plugin_config_models.py")
     if (
@@ -360,5 +523,6 @@ def install_settings(package, data_root, plugin):
     module = package("gsuid_core.utils.plugins_config.gs_config")
     registry = {}
     module.StringConfig = configuration_type(data_root, plugin, registry=registry)
+    module.ConfigSetManager = configuration_manager_type(data_root, module.StringConfig)
     module.all_config_list = MappingProxyType(registry)
     module.reconcile_config = reconcile_config

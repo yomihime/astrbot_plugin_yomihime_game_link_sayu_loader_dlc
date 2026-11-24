@@ -81,6 +81,85 @@ async def business(models, base):
     return result
 
 
+async def presentation(models):
+    language = models.WavesLangSettings
+    values = [await language.get_lang("actor")]
+    for selected in ("en", "", "kr"):
+        await language.set_lang("actor", selected)
+        values.append(await language.get_lang("actor"))
+    return values
+
+
+async def independent_preferences(orm):
+    from contextlib import closing
+    import sqlite3
+    from gsuid_core.utils.database import base_models as base
+    from plugin_bindings import binding_scope
+    from port_errors import Unsupported
+    from service_settings import management_scope
+    from sqlmodel import Field
+
+    class ReaderSettings(base.BaseIDModel, table=True):
+        __module__ = "plugins.Reader.settings"
+        user_id: str = Field(unique=True)
+        locale: str
+
+    class RoomSettings(base.BaseIDModel, table=True):
+        __module__ = "plugins.Reader.settings"
+        user_id: str = Field(unique=True)
+        locale: str
+        group_id: str
+
+    class UnknownSettings(base.BaseIDModel, table=True):
+        __module__ = "plugins.Reader.settings"
+        user_id: str = Field(unique=True)
+        locale: str
+        payload: str
+
+    class AccountSettings(base.BaseIDModel, table=True):
+        __module__ = "plugins.Reader.settings"
+        user_id: str = Field(unique=True)
+        locale: str
+        token: str
+
+    with management_scope(writable=True):
+        async with orm.startup():
+            await orm.migrate()
+
+    @base.with_session
+    async def add(cls, session, **values):
+        session.add(cls(user_id="reader", locale="fr", **values))
+
+    with binding_scope("reader", "local", True, preferences=True):
+        await add(ReaderSettings)
+        for model, values in (
+            (RoomSettings, {"group_id": "room"}),
+            (UnknownSettings, {"payload": "x"}),
+            (AccountSettings, {"token": "fixture"}),
+        ):
+            try:
+                await add(model, **values)
+            except Unsupported:
+                continue
+            raise AssertionError(f"{model.__name__} received a preference grant")
+        assert [m.__name__ for m in orm.preferences] == ["ReaderSettings"]
+        row = await ReaderSettings.base_select_data(user_id="reader")
+        assert row.locale == "fr"
+        with closing(sqlite3.connect(orm.access().path)) as db, db:
+            db.execute("ALTER TABLE readersettings ADD COLUMN legacy_secret TEXT")
+        try:
+            await add(ReaderSettings)
+        except Unsupported as exc:
+            assert "differs from its declared model" in str(exc)
+        else:
+            raise AssertionError("a stale physical table received a preference grant")
+        return {
+            "profile": "Reader",
+            "table": ReaderSettings.__tablename__,
+            "locale": row.locale,
+        }
+
+
 async def child(kind, source, worker):
     sys.addaudithook(offline)
     work = Path.cwd()
@@ -95,7 +174,10 @@ async def child(kind, source, worker):
         await startup.create_core_tables()
         await startup.trans_adapter()
         await models._waves_auto_migrate()
-        return {"observations": await business(models, base)}
+        return {
+            "observations": await business(models, base),
+            "preferences": await presentation(models),
+        }
     sys.path.insert(0, str(worker))
     import plugin_bindings
     from port_errors import Unsupported
@@ -106,9 +188,12 @@ async def child(kind, source, worker):
     from sqlalchemy.exc import DBAPIError
 
     data = work / "private"
-    install(PLUGIN, "ww", data, source_root=source)
+    plugin = "Reader" if kind == "independent" else PLUGIN
+    install(plugin, "ww", data, source_root=source)
     runtime = PluginRuntime(data)
-    runtime.install(source, PLUGIN)
+    runtime.install(source, plugin)
+    if kind == "independent":
+        return await independent_preferences(runtime.orm)
     orm = runtime.orm
     with management_scope(writable=True):
         async with orm.startup():
@@ -124,14 +209,22 @@ async def child(kind, source, worker):
                 )
     from gsuid_core.utils.database import base_models as base
 
-    def actor(name="actor", *, private=True, writable=False):
+    def actor(
+        name="actor",
+        *,
+        adapter="adapter",
+        private=True,
+        writable=False,
+        preferences=False,
+    ):
         return plugin_bindings.binding_scope(
-            name, "adapter", private, writable=writable
+            name, adapter, private, writable=writable, preferences=preferences
         )
 
     if kind == "reload":
         with actor():
             uid = await models.WavesBind.get_uid_by_game("actor", "adapter")
+            assert await models.WavesLangSettings.get_lang("actor") == "kr"
             assert (
                 uid == "1205"
                 and first["already_applied"] == 48
@@ -168,6 +261,49 @@ async def child(kind, source, worker):
         except Unsupported:
             return True
         raise AssertionError("operation unexpectedly succeeded")
+
+    language = models.WavesLangSettings
+    with actor(preferences=True):
+        preferences = await presentation(models)
+
+        @base.with_session
+        async def raw_preference(cls, session, sql):
+            await session.execute(text(sql))
+
+        for sql in (
+            "UPDATE WavesBind SET uid='wrong'",
+            "SELECT cookie FROM WavesUser",
+            "UPDATE CoreUser SET language='jp'",
+            "UPDATE _sayu_migrations SET digest='wrong'",
+            "INSERT INTO WavesLangSettings(user_id,lang) VALUES ('other','jp')",
+            "UPDATE WavesLangSettings SET user_id='other'",
+        ):
+            await must_deny(raw_preference(language, sql))
+        await must_deny(language.set_lang("other", "jp"))
+        await must_deny(
+            models.WavesUser.insert_data("actor", "adapter", uid="11", cookie="denied")
+        )
+        await must_deny(asyncio.create_task(language.set_lang("actor", "jp")))
+        assert await models.WavesUser.get_user_cookie_by_uid("11") is None
+    with actor():
+        await must_deny(language.set_lang("actor", "jp"))
+        assert await language.get_lang("actor") == "kr"
+    with actor("other"):
+        assert await language.get_lang("other") == ""
+    with actor(adapter="other"):
+        assert await language.get_lang("actor") == ""
+    with actor(private=False, preferences=True):
+        await must_deny(language.set_lang("actor", "jp"))
+    resume = asyncio.Event()
+
+    async def deferred_write():
+        await resume.wait()
+        await language.set_lang("actor", "jp")
+
+    with actor(preferences=True):
+        deferred = asyncio.create_task(deferred_write())
+    resume.set()
+    await must_deny(deferred)
 
     limits = []
     with actor():
@@ -218,6 +354,7 @@ async def child(kind, source, worker):
         assert await models.WavesBind.get_uid_by_game("actor", "adapter") == "1205"
     return {
         "observations": observed,
+        "preferences": preferences,
         "owner_checks": len(limits),
         "concurrent_increments": 2,
         "migrations": [first, repeated, failed, recovered],
@@ -226,7 +363,9 @@ async def child(kind, source, worker):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--child", choices=("loader", "native", "reload"))
+    parser.add_argument(
+        "--child", choices=("loader", "native", "reload", "independent")
+    )
     parser.add_argument("--source", type=Path)
     parser.add_argument("--worker", type=Path)
     parser.add_argument("--loader-python", type=Path, default=Path(sys.executable))
@@ -247,6 +386,7 @@ def main():
             source, native, loader = (work / p for p in ("source", "native", "loader"))
             sources = copy_reference(args.reference.resolve(), native)
             loader.mkdir()
+            (work / "independent").mkdir()
             with ZipFile(snap) as zipped:
                 prefix = f"{PLUGIN}/{PLUGIN}/utils/database/"
                 for name in zipped.namelist():
@@ -258,6 +398,7 @@ def main():
             for kind, interpreter in (
                 ("loader", args.loader_python.resolve()),
                 ("reload", args.loader_python.resolve()),
+                ("independent", args.loader_python.resolve()),
                 ("native", sys.executable),
             ):
                 output = work / (kind + ".json")
@@ -292,9 +433,9 @@ def main():
     args.output.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    if (
-        not args.child
-        and report["native"]["observations"] != report["loader"]["observations"]
+    if not args.child and any(
+        report["native"][k] != report["loader"][k]
+        for k in ("observations", "preferences")
     ):
         raise SystemExit("native/loader model results differ")
 

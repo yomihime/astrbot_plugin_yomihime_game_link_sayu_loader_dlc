@@ -37,7 +37,11 @@ def archive(files):
     return stream.getvalue()
 
 
-def worker_archive(lock, *, offline=False):
+def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot=None):
+    if public_resources_only and (offline or snapshot is None):
+        raise ValueError(
+            "public resource mode needs a pinned snapshot and cannot be offline"
+        )
     worker = ROOT / "worker"
     # Historical offline declaration probes are not part of the package runtime.
     probe_modules = {
@@ -64,23 +68,47 @@ def worker_archive(lock, *, offline=False):
     files["__main__.py"] = files.pop("entry.py")
     resources = json.loads((ROOT / "profiles/public_resources.json").read_bytes())
     policy = resources.get(lock["package"], {})
+    manifest = json.loads(
+        (ROOT / "packages/sayu_loader/yomihime.manifest.json").read_bytes()
+    )
+    owner_writes = tuple(
+        cap["capability_id"]
+        for module in manifest["modules"]
+        if module["module_id"] == lock.get("module_id")
+        for cap in module["capabilities"]
+        if cap["effect"] == "write" and cap["privacy_floor"] == "owner"
+    )
+    static_urls, directories = (), ()
+    if public_resources_only:
+        from resource_policy import from_snapshot
+
+        static_urls, directories = from_snapshot(snapshot, lock)
     files["game_profile.py"] = (
         f"PACKAGE = {lock['package']!r}\nPREFIX = {lock['prefix']!r}\n"
         f"RUNTIME_MODE = {lock.get('runtime_mode', 'package')!r}\n"
         f"OFFLINE = {offline!r}\n"
+        f"OWNER_WRITES = {owner_writes!r}\n"
+        f"PUBLIC_RESOURCES_ONLY = {public_resources_only!r}\n"
+        f"STATIC_RESOURCE_URLS = {tuple(static_urls)!r}\n"
+        f"STATIC_RESOURCE_DIRECTORIES = {tuple(directories)!r}\n"
         f"PUBLIC_IMAGE_ORIGINS = {tuple(policy.get('image_origins', ()))!r}\n"
         f"PUBLIC_BULK_MIRRORS = {tuple(policy.get('bulk_mirrors', ()))!r}\n"
     ).encode("utf-8")
     return archive(files)
 
 
-def prepare(key, lock, *, data_root=None, offline=False):
+def prepare(key, lock, *, data_root=None, offline=False, public_resources_only=False):
     directory = LOCAL / key
     requirements = ROOT / "profiles" / f"{key}-requirements.txt"
     exe, _ = selected(directory, requirements.read_bytes())
     runtime = LOCAL / "runtime"
     snapshot = pinned_snapshot(directory, lock, runtime)
-    blob = worker_archive(lock, offline=offline)
+    blob = worker_archive(
+        lock,
+        offline=offline,
+        public_resources_only=public_resources_only,
+        snapshot=snapshot,
+    )
     sha = digest(blob)
     target = runtime / f"{key}-{sha}.pyz"
     publish_archive(target, blob)
@@ -107,13 +135,19 @@ def publish_archive(target, data):
         pending.unlink(missing_ok=True)
 
 
-def build(*, fresh_data=False, offline=False):
+def build(*, fresh_data=False, offline=False, public_resources_only=False):
     locks = json.loads((ROOT / "profiles/lock.json").read_bytes())
     data_root = (
         Path(tempfile.mkdtemp(prefix="acceptance-", dir=LOCAL)) if fresh_data else None
     )
     workers = {
-        key: prepare(key, spec, data_root=data_root, offline=offline)
+        key: prepare(
+            key,
+            spec,
+            data_root=data_root,
+            offline=offline,
+            public_resources_only=public_resources_only,
+        )
         for key, spec in locks.items()
     }
     files = {
@@ -165,10 +199,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fresh-data", action="store_true", help="bind new empty private profiles"
     )
-    parser.add_argument(
+    network = parser.add_mutually_exclusive_group()
+    network.add_argument(
         "--offline",
         action="store_true",
         help="run upstream code with external networking disabled",
     )
+    network.add_argument(
+        "--public-resources-only",
+        action="store_true",
+        help="allow only the pinned static resource GET port; block direct upstream networking",
+    )
     options = parser.parse_args()
-    build(fresh_data=options.fresh_data, offline=options.offline)
+    build(
+        fresh_data=options.fresh_data,
+        offline=options.offline,
+        public_resources_only=options.public_resources_only,
+    )

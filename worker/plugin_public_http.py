@@ -6,11 +6,18 @@ from pathlib import Path
 import re
 import socket
 import ssl
+from time import monotonic
 from urllib.parse import urlsplit
 
 from port_errors import Unsupported
 
 
+ERROR_MEDIA_TYPES = {
+    "text/plain",
+    "text/html",
+    "application/json",
+    "application/problem+json",
+}
 _IMAGE_URL = re.compile(
     rb"""https://[A-Za-z0-9.-]+/[A-Za-z0-9_./%~-]+\.(?:png|jpe?g|webp|gif|avif)(?=["'\s])""",
     re.I,
@@ -44,7 +51,21 @@ class PublishedImages:
         return status, content
 
 
-def read_public_https(url, limit, *, accept, skip_error_body=False):
+def read_public_https(
+    url, limit, *, accept, skip_error_body=False, error_body_limit=0, deadline=None
+):
+    from resource_broker import CLIENT
+
+    if CLIENT is not None:
+        return CLIENT.read(url, limit)
+    deadline = monotonic() + 15 if deadline is None else min(deadline, monotonic() + 15)
+
+    def remaining(timeout):
+        seconds = deadline - monotonic()
+        if seconds <= 0:
+            raise TimeoutError("public resource read deadline exceeded")
+        return min(seconds, timeout)
+
     target = urlsplit(url)
     if (
         target.scheme != "https"
@@ -54,6 +75,7 @@ def read_public_https(url, limit, *, accept, skip_error_body=False):
         or target.fragment
     ):
         raise Unsupported("invalid published image URL")
+    remaining(8)
     addresses = socket.getaddrinfo(target.hostname, 443, type=socket.SOCK_STREAM)
     peers = [ipaddress.ip_address(row[4][0]) for row in addresses]
     if not peers or any(not peer.is_global or peer.is_multicast for peer in peers):
@@ -66,7 +88,7 @@ def read_public_https(url, limit, *, accept, skip_error_body=False):
         for family, kind, proto, _, sockaddr in addresses:
             peer = socket.socket(family, kind, proto)
             try:
-                peer.settimeout(3)
+                peer.settimeout(remaining(3))
                 peer.connect(sockaddr)
                 connection.sock = ssl.create_default_context().wrap_socket(
                     peer, server_hostname=target.hostname
@@ -80,24 +102,49 @@ def read_public_https(url, limit, *, accept, skip_error_body=False):
                 last = exc
         else:
             raise last
-        connection.sock.settimeout(8)
+        connection.sock.settimeout(remaining(8))
         connection.request(
             "GET",
             target.path or "/",
             headers={"Accept": accept, "Accept-Encoding": "identity"},
         )
         response = connection.getresponse()
-        if skip_error_body and response.status != 200:
-            return response.status, response.getheaders(), b""
+        error_body = skip_error_body and response.status != 200
+        if error_body:
+            mime = (
+                response.getheader("Content-Type", "").partition(";")[0].strip().lower()
+            )
+            if (
+                not error_body_limit
+                or not 400 <= response.status < 500
+                or mime not in ERROR_MEDIA_TYPES
+                or response.getheader("Content-Encoding", "identity").lower()
+                != "identity"
+            ):
+                return response.status, [], b""
+            limit = min(limit, error_body_limit)
+            if response.length is not None and response.length > limit:
+                return response.status, [], b""
         # Do not automatically forward a request to a new URL. sget's
         # httpx transport rechecks the exact target on every redirect.
         if response.getheader("Content-Encoding", "identity").lower() != "identity":
             raise Unsupported("published image needs identity encoding")
-        body = response.read(limit + 1)
-        if len(body) > limit:
-            raise Unsupported("published image exceeds the worker limit")
+        body = bytearray()
+        while True:
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining(8))
+            else:
+                remaining(8)
+            chunk = response.read1(min(65536, limit + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > limit:
+                if error_body:
+                    return response.status, [], b""
+                raise Unsupported("published image exceeds the worker limit")
         if response.length not in (None, 0):
             raise http.client.IncompleteRead(body, response.length)
-        return response.status, response.getheaders(), body
+        return response.status, response.getheaders(), bytes(body)
     finally:
         connection.close()

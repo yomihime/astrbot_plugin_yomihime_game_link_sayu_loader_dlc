@@ -36,7 +36,8 @@ PROTECTED = {
 
 
 class ProfileConfig:
-    def __init__(self, root):
+    def __init__(self, root, plugin_store=None):
+        self._plugin_store = plugin_store
         self.path = Path(root).resolve() / "framework-config.sqlite3"
         self.values = deepcopy(DEFAULTS)
         self.pending = {}
@@ -126,7 +127,10 @@ class ProfileConfig:
             )
         self.pending.clear()
 
-    lazy_write_config = write_config
+    def lazy_write_config(self):
+        self.write_config()
+        if self._plugin_store is not None:
+            self._plugin_store.save_dirty()
 
     def set_config(self, key, value):
         if not self._can_update(key):
@@ -143,7 +147,9 @@ class ProfileConfig:
         return True
 
 
-def install_core_config(module, data_root):
+def install_core_config(module, data_root, plugin_store=None):
     module.CONFIG_DEFAULT = deepcopy(DEFAULTS)
-    module.core_config = ProfileConfig(data_root)
+    module.core_config = ProfileConfig(data_root, plugin_store)
+    if plugin_store is not None:
+        module.plugin_config_store = plugin_store.public_view()
     return module.core_config

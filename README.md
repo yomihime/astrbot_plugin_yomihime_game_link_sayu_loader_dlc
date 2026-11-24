@@ -41,6 +41,13 @@ StarRailUID 0.2.0 的遗器图鉴按中文套装名遍历 `SetId2Name` 的键，
 
 下例使用 Windows Python Launcher。每个 profile 的解释器和依赖安装到仓库忽略的 `.sayu-local/<profile>/env-*`。变更依赖清单或基础 Python 后，prepare 会新建环境，安装成功才更新 `environment.json`。构建器将选中的解释器绝对路径写入安装 ZIP。移动源码仓库或更换机器后需重新构建。
 
+首次构建还需把固定参考源码放入 `.sayu-local/reference`。构建器会核对使用到的字体、翻译、模型定义及绘图函数的摘要，随后将它们装入本机 worker。运行中的 AstrBot 不启动 GsCore，也无需其服务或测试解释器。
+
+```powershell
+git clone --no-checkout https://github.com/Genshin-bots/gsuid_core.git .sayu-local/reference
+git -C .sayu-local/reference checkout --detach 96cd7353be3100ff982bccc33e554961837c778e
+```
+
 ```powershell
 py -3.12 scripts/prepare.py starrail
 py -3.13 scripts/prepare.py genshin
@@ -55,6 +62,8 @@ python scripts/check_local.py --core <本地-YGL-Core-源码目录>
 ```
 
 用 `python scripts/build_local.py --fresh-data --offline` 可为离线验收绑定全新的私有数据目录。资源请求会留下失败诊断，需要外部数据的业务须另外验证。
+
+需要在空资料下正常获取公开素材时，使用 `python scripts/build_local.py --fresh-data --public-resources-only`。独立读取进程按固定归档与 profile 的声明访问 HTTPS 图片、资源索引和静态数据。游戏进程中的其他网络请求仍被拒绝。启动钩子会实际下载素材；由于宿主给模块登记的时间有限，启动期使用累计传输预算。可从 inventory 的已写入文件数、未完成目录及失败原因判断实际进度。
 
 将 `dist/` 中生成的 ZIP 通过本机 AstrBot 的插件安装入口上传。单元测试使用独立样例验证发现、匹配、消息与打包。SDK 检查使用上面的三条真实上游指令，核对原神 JPEG、鸣潮完整文本、星铁别名和停用重载行为。给检查脚本加上 `--list-commands` 可查看当前候选实际注册的服务、触发方式和前缀要求。该选项只列注册项；需要公开数据或外部素材的查询仍取决于数据是否可用。WebChat 实收需单独验收。
 

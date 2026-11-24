@@ -1,6 +1,7 @@
 """Serve requests on a single event loop until this module generation retires."""
 
 import asyncio
+from contextlib import nullcontext
 import errno
 import json
 import os
@@ -8,8 +9,9 @@ import sys
 from pathlib import Path
 
 import sayu_compat
+import game_profile
 from port_errors import Unsupported
-from game_profile import OFFLINE, PACKAGE, PREFIX, RUNTIME_MODE
+from game_profile import OFFLINE, OWNER_WRITES, PACKAGE, PREFIX, RUNTIME_MODE
 from images import prepare_owner_parts, prepare_public_parts
 from plugin_runtime import PluginRuntime
 from plugin_bindings import binding_scope
@@ -29,7 +31,9 @@ class Worker:
         )
         if RUNTIME_MODE != "package":
             raise ValueError("package initialization is required")
-        with management_scope(writable=True):
+        from resource_broker import startup_resources
+
+        with management_scope(writable=True), startup_resources():
             await self.plugin.start(self.source, PACKAGE)
 
     async def handle(self, request):
@@ -46,14 +50,32 @@ class Worker:
             }
             if request.get("list_triggers"):
                 report["triggers"] = sayu_compat.registered_triggers()
+            from resource_broker import CLIENT
+
+            if CLIENT is not None:
+                report["public_resource_startup"] = CLIENT.startup_diagnostics
+                report["public_static_httpx"] = list(getattr(CLIENT, "static_httpx", ()))
             return report
         if request.get("op") is not None:
             raise ValueError("unknown operation")
         event = request["event"]
+        owner_action = (
+            request.get("owner_action") is True
+            and request.get("private_image") is True
+            and request.get("capability_id") in OWNER_WRITES
+            and event.get("conversation_kind") == "direct"
+            and not event.get("group_id")
+            and bool(event.get("actor_id") and event.get("adapter_id"))
+        )
         with (
             management_scope(),
             binding_scope(
-                event.get("actor_id"), event.get("adapter_id"), request["private_image"]
+                event.get("actor_id"),
+                event.get("adapter_id"),
+                request["private_image"],
+                preferences=owner_action,
+                uid_read=owner_action,
+                uid_write=owner_action,
             ),
         ):
             parts = await sayu_compat.dispatch(request["text"], **event)
@@ -83,7 +105,7 @@ def error_code(exc):
 
 
 async def serve(output):
-    if OFFLINE:
+    if OFFLINE or getattr(game_profile, "PUBLIC_RESOURCES_ONLY", False):
         from worker_storage import install_offline_guard
 
         install_offline_guard()
@@ -107,6 +129,7 @@ async def serve(output):
         },
     )
     try:
+        worker.downloads.mirror.start_continuations()
         while True:
             line = await asyncio.to_thread(sys.stdin.buffer.readline, 16385)
             if not line:
@@ -119,8 +142,15 @@ async def serve(output):
                 reply = {"error": error_code(exc)}
             send(output, reply)
     finally:
-        if worker.plugin:
-            await worker.plugin.stop()
+        from resource_broker import CLIENT
+
+        try:
+            await worker.downloads.mirror.stop_continuations()
+            if worker.plugin:
+                await worker.plugin.stop()
+        finally:
+            if CLIENT is not None:
+                CLIENT.close()
 
 
 class ProfileBusy(RuntimeError):
@@ -168,8 +198,23 @@ def main():
             )
             return
         with lock:
-            install_write_guard(Path(sys.argv[1]).resolve().parent, sys.argv[2])
-            asyncio.run(serve(output))
+            from resource_broker import activate
+
+            resource_mode = getattr(game_profile, "PUBLIC_RESOURCES_ONLY", False)
+            with (
+                activate(Path(sys.argv[0]).resolve())
+                if resource_mode
+                else nullcontext()
+            ):
+                install_write_guard(Path(sys.argv[1]).resolve().parent, sys.argv[2])
+                if resource_mode:
+                    from resource_broker import CLIENT
+                    from resource_httpx import static_httpx
+
+                    with static_httpx(game_profile, CLIENT):
+                        asyncio.run(serve(output))
+                else:
+                    asyncio.run(serve(output))
 
 
 if __name__ == "__main__":

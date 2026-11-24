@@ -208,6 +208,9 @@ class PluginRuntime:
             from gsuid_core.logger import logger
 
             logger.warning("Infrastructure plugin has no loaded API facade")
+        from sayu_compat import flush_loaded_service_settings
+
+        flush_loaded_service_settings()
 
     async def start(self, source, plugin):
         self.install(source, plugin)

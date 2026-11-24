@@ -94,9 +94,9 @@ class Module:
         # The original Waves query is owner-scoped. Public routes also expose
         # the SDK owner transport for copyable replies in a direct conversation.
         public = self.key != "waves"
-        handlers = {"query": Command(self, not public)}
+        handlers = {"query": Command(self, "query", not public)}
         if public:
-            handlers["direct"] = Command(self, True)
+            handlers["direct"] = Command(self, "direct", True)
         return ygl.ModuleHandlers(handlers, {}, {})
 
     async def start(self):
@@ -160,10 +160,7 @@ class Module:
             {key: ygl.CapabilityHealth(status) for key in self.handlers().capabilities}
         )
 
-    async def exchange(self, request):
-        encoded = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
-        if len(encoded) > 16384:
-            raise ValueError("worker request too large")
+    async def exchange(self, request, *, owner_context=None):
         async with self.io:
             process = self.process
             if (
@@ -172,6 +169,15 @@ class Module:
                 or process.returncode is not None
             ):
                 raise ygl.ServiceUnavailable()
+            if owner_context is not None:
+                # Recheck Core's live owner proof after waiting for the worker.
+                scope = await self.services.scopes.bind(owner_context)
+                if scope.invocation is not owner_context:
+                    raise ygl.AccessDenied()
+                request = {**request, "owner_action": True}
+            encoded = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
+            if len(encoded) > 16384:
+                raise ValueError("worker request too large")
             try:
                 process.stdin.write(encoded)
                 await process.stdin.drain()
@@ -317,14 +323,89 @@ ERRORS = {
 
 
 class Command:
-    def __init__(self, module, private):
+    def __init__(self, module, capability_id, private):
         self.module = module
+        self.capability_id = capability_id
         self.private = private
         self.revision = module.revision
 
     async def document(self, context, text, parts, privacy):
         if not isinstance(parts, list) or not 1 <= len(parts) <= 64:
             raise ValueError("invalid message chain")
+        if any(isinstance(part, dict) and "poster" in part for part in parts):
+            if (
+                privacy is not ygl.Privacy.PUBLIC
+                or len(parts) != 1
+                or parts[0].keys() != {"poster"}
+            ):
+                raise UnsupportedProjection(
+                    "image pages require one public source image"
+                )
+            poster = parts[0]["poster"]
+            if not isinstance(poster, dict) or poster.keys() != {
+                "width",
+                "height",
+                "tiles",
+            }:
+                raise UnsupportedProjection("invalid public image pages")
+            width, height, tiles = poster["width"], poster["height"], poster["tiles"]
+            if (
+                type(width) is not int
+                or type(height) is not int
+                or not (
+                    1 <= width <= 1536
+                    and 1 <= height <= 8192
+                    and width * height <= 8_000_000
+                )
+            ):
+                raise UnsupportedProjection("invalid public image dimensions")
+            grid_width = max(400, width)
+            columns = max(8, (grid_width + 95) // 96)
+            cell_width = (grid_width + columns - 1) // columns
+            cell_height = 128
+            expected = columns * ((height + cell_height - 1) // cell_height)
+            if not isinstance(tiles, list) or len(tiles) != expected or expected > 1000:
+                raise UnsupportedProjection("incomplete public image")
+            items = []
+            total = 0
+            for i, encoded in enumerate(tiles):
+                raw = base64.b64decode(encoded, validate=True)
+                total += len(raw)
+                if (
+                    total > 4 * 1024 * 1024
+                    or len(raw) > 1024 * 1024
+                    or raw[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                    or int.from_bytes(raw[16:20], "big") != cell_width
+                    or int.from_bytes(raw[20:24], "big") != cell_height
+                ):
+                    raise UnsupportedProjection("invalid public image tile")
+                items.append(
+                    ygl.cards.DenseCollageItem(
+                        str(i + 1), 1, ygl.cards.Asset("png", raw)
+                    )
+                )
+            pages = ygl.cards.DenseCollage(
+                tuple(items),
+                columns=columns,
+                cell_width=cell_width,
+                cell_height=cell_height,
+                max_height=1024,
+                max_pages=8,
+                fit="contain",
+            )
+            card = ygl.cards.Document(
+                text,
+                (pages,),
+                width=columns * cell_width,
+                subtitle="同一张原图按从上到下的顺序阅读",
+            )
+            return ygl.DisplayDocument(
+                "Sayu Loader",
+                self.module.key,
+                text_blocks(["原图未完整显示。"], self.module.key),
+                card=card,
+                privacy=privacy,
+            )
         texts, blocks, images = [], [], []
         for part in parts:
             if isinstance(part, dict) and part.keys() == {"text"}:
@@ -382,11 +463,23 @@ class Command:
             text = parameters["text"]
             request = {
                 "text": text,
+                "capability_id": self.capability_id,
                 "event": module.event(context, self.private),
                 "private_image": privacy is ygl.Privacy.PRIVATE,
             }
             async with asyncio.timeout(20):
-                reply = await module.exchange(request)
+                if (
+                    self.private
+                    and getattr(context, "origin", None) == "command"
+                    and context.parent_id is None
+                    and context.capability_id == self.capability_id
+                    and context.actor_id
+                    and context.adapter_id
+                    and context.conversation_id
+                ):
+                    reply = await module.exchange(request, owner_context=context)
+                else:
+                    reply = await module.exchange(request)
                 if "error" not in reply:
                     document = await self.document(
                         context, text, reply["parts"], privacy
@@ -400,6 +493,8 @@ class Command:
                 error = reply["error"]
         except UnsupportedProjection:
             error = "unsupported_message"
+        except (ygl.AccessDenied, ygl.InvalidInvocation):
+            raise
         except TimeoutError:
             error = "timeout"
         except (OSError, EOFError, ValueError, TypeError, KeyError):

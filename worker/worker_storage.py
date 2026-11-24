@@ -3,9 +3,69 @@
 import os
 from pathlib import Path
 import socket
+import stat
 import sys
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
+
+
+def publish_new_config(pending, destination):
+    """Atomically move a completed private file, leaving any existing target intact."""
+    if not pending.is_absolute() or pending.parent != destination.parent:
+        raise ValueError("configuration publication requires adjacent absolute paths")
+    info = pending.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise PermissionError(
+            "configuration publication requires a private regular file"
+        )
+    if os.name == "nt":
+        try:
+            pending.rename(destination)
+        except FileExistsError:
+            return False
+        return True
+    return _publish_posix(pending, destination)
+
+
+def _publish_posix(pending, destination):
+    import ctypes
+    import errno
+
+    source, target = os.fsencode(pending), os.fsencode(destination)
+    if b"\0" in source or b"\0" in target:
+        raise ValueError("invalid configuration path")
+    # ctypes does not emit CPython's rename event. Validate the exact syscall
+    # arguments with the same audit hooks used by os.rename before entering libc.
+    sys.audit("os.rename", source, target, -1, -1)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        signature = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        # AT_FDCWD and RENAME_NOREPLACE from the Linux userspace ABI.
+        args = (-100, source, -100, target, 1)
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        signature = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        # Darwin RENAME_EXCL, available since macOS 10.12.
+        args = (source, target, 4)
+    else:
+        rename = None
+    if rename is None:
+        raise OSError(errno.ENOSYS, "exclusive configuration rename unavailable")
+    rename.argtypes = signature
+    rename.restype = ctypes.c_int
+    if rename(*args) == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    raise OSError(error, os.strerror(error), os.fsdecode(target))
 
 
 def install_offline_guard():
@@ -26,6 +86,7 @@ def install_offline_guard():
             "socket.getaddrinfo",
             "socket.gethostbyname",
             "socket.gethostbyaddr",
+            "socket.getnameinfo",
             "socket.bind",
             "socket.sendto",
             "socket.sendmsg",

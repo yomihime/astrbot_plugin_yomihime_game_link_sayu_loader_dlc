@@ -34,7 +34,7 @@ from plugin_messages import (
     MessageReceive,
     MessageSend,
 )
-from service_settings import ServiceSettings
+from service_settings import select_service_profile
 from plugin_app_life import install_app_life
 from plugin_ai import install_ai
 from plugin_qrlogin import install_qrlogin
@@ -200,7 +200,7 @@ class SV:
     def set(self, is_lazy=True, **changes):
         if _service_store is None or _services.get(self.name) is not self:
             raise Unsupported("service management requires the active package")
-        _service_store.update("service", self, changes)
+        _service_store.update("service", self, changes, is_lazy)
 
     def enable(self):
         self.set(enabled=True)
@@ -376,7 +376,7 @@ class Plugins:
     def set(self, is_lazy=True, **changes):
         if _service_store is None or _plugin_settings.get(self.name) is not self:
             raise Unsupported("plugin management requires the active package")
-        _service_store.update("plugin", self, changes)
+        _service_store.update("plugin", self, changes, is_lazy)
 
 
 class MessageSegment:
@@ -756,22 +756,41 @@ class Bot:
             del self.messages[count:]
             raise
 
-    async def send_option(self, value, options):
-        await self.send(value)
-        # WebChat's text/image transport exposes the commands as plain text.
-        if options:
+    async def send_option(
+        self,
+        reply=None,
+        option_list=None,
+        unsuported_platform=None,
+        sep="\n",
+        command_tips="请输入以下命令之一:",
+        command_start_text="",
+        at_sender=False,
+    ):
+        if reply is None and option_list:
+            reply = "请在60秒内做出选择..."
+        if reply is not None:
+            await self.send(reply, at_sender)
+        # An explicit False requests only the native reply on a text-only adapter.
+        if option_list and unsuported_platform is not False:
             choices = []
-            for row in options:
+            for row in option_list:
                 for b in row if isinstance(row, (tuple, list)) else (row,):
-                    if not isinstance(b, Button):
+                    if isinstance(b, Button):
+                        data = b.data
+                        prefix = b.prefix or _prefix
+                    elif isinstance(b, str):
+                        data, prefix = b, _prefix
+                    else:
                         raise UnsupportedMessage("unsupported button")
-                    prefix = b.prefix or _prefix
-                    data = b.data
-                    if data and not data.startswith((prefix, "https://", "http://")):
+                    if unsuported_platform is True:
+                        data = command_start_text + data
+                    elif data and not data.startswith((prefix, "https://", "http://")):
                         data = prefix + data
                     if data:
                         choices.append(data)
-            self._append("\n".join(choices))
+            if choices:
+                tips = f"\n{command_tips}\n" if unsuported_platform else ""
+                self._append(tips + sep.join(choices))
 
 
 def get_res_path(_path=None):
@@ -813,6 +832,11 @@ def get_plugin_available_prefix(name):
     return ""
 
 
+def flush_loaded_service_settings():
+    if _service_store is not None:
+        _service_store._after_load()
+
+
 def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
     global _plugin, _prefix, _data_root, _source, _service_store
     _routes.clear()
@@ -826,7 +850,7 @@ def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
         runtime_mode = getattr(
             sys.modules.get("game_profile"), "RUNTIME_MODE", "package"
         )
-    _service_store = ServiceSettings(_data_root) if runtime_mode == "package" else None
+    _service_store = select_service_profile(_data_root, plugin, runtime_mode == "package")
     _source = (
         Path(source_root).resolve()
         if source_root
@@ -874,7 +898,9 @@ def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
     segments = package("gsuid_core.segment")
     segments.MessageSegment = MessageSegment
     segments.process_buttons = process_buttons
-    core_config = install_core_config(package("gsuid_core.config"), _data_root)
+    core_config = install_core_config(package("gsuid_core.config"), _data_root, _service_store)
+    if _service_store is not None:
+        sv.config_plugins = _service_store.get_all()
     install_ai(package)
     install_logger(package("gsuid_core.logger"), core_config, source_root=_source)
     install_data_store(package("gsuid_core.data_store"), get_res_path)

@@ -25,6 +25,12 @@ from sqlmodel import Field, SQLModel
 
 from port_errors import Unsupported
 import plugin_bindings
+from plugin_orm_preferences import (
+    OWNER_ERROR,
+    guard_preferences,
+    permits,
+    preference_columns,
+)
 from service_settings import _grant
 
 logger = SimpleNamespace(trace=logging.getLogger("sayu.orm").debug)
@@ -44,6 +50,7 @@ class Access:
     startup: bool
     origin: object
     task: object
+    preference: tuple[str, frozenset[str]] | None = None
 
     def check(self):
         if self.root is not _runtime or asyncio.current_task() is not self.task:
@@ -70,7 +77,7 @@ def session_decorator(function, read_only):
 
     @wraps(function)
     async def wrapper(self, *args, **kwargs):
-        access = _runtime.access(read_only)
+        access = _runtime.access(read_only, self)
         if not access.startup:
             values = signature.bind(self, None, *args, **kwargs).arguments
             _validate_values(access.origin, values)
@@ -153,6 +160,7 @@ class PluginORM:
         self.report = {}
         self.writer = asyncio.Lock()
         self.writer_task = None
+        self.preferences = {}
 
     def path(self, name):
         path = self.root / name
@@ -189,7 +197,7 @@ class PluginORM:
             boot.writable = False
             _boot.reset(token)
 
-    def access(self, read_only=False):
+    def access(self, read_only=False, model=None):
         task = asyncio.current_task()
         owner = plugin_bindings._current.get()
         if owner is None:
@@ -203,14 +211,22 @@ class PluginORM:
             raise Unsupported("database requires the active private owner task")
         identity = json.dumps([owner.adapter, owner.actor], ensure_ascii=True).encode()
         path = self.path(hashlib.sha256(identity).hexdigest() + ".sqlite3")
-        write = owner.writable and not read_only
+        preference = None
+        if (
+            not owner.writable
+            and owner.preferences
+            and not read_only
+            and isinstance(model, type)
+        ):
+            preference = self.preferences.get(model)
+        write = not read_only and (owner.writable or preference is not None)
         if not path.exists():
             template = self.path("empty.sqlite3")
             if write:
                 self.clone_schema(template, path)
             else:
                 path = template
-        return Access(self, path, write, False, owner, task)
+        return Access(self, path, write, False, owner, task, preference)
 
     def publish_empty_schema(self):
         # Plugin startup may seed records in its own store. A new actor inherits
@@ -308,6 +324,10 @@ class PluginORM:
                 )
             elif action in _SCHEMA:
                 allowed = access.startup and access.writable
+            if access.preference and (action in _DML or action == sqlite3.SQLITE_READ):
+                allowed = permits(
+                    access.preference, action, first, second, database, trigger
+                )
             if not allowed:
                 rejected.append(action)
             return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
@@ -315,6 +335,8 @@ class PluginORM:
         @event.listens_for(db.sync_engine, "connect")
         def configure(connection, record):
             connection.isolation_level = None
+            if access.preference:
+                connection.run_async(lambda driver: guard_preferences(driver, access))
             connection.run_async(lambda driver: driver.set_authorizer(authorize))
 
         @event.listens_for(db.sync_engine, "begin")
@@ -332,6 +354,8 @@ class PluginORM:
         try:
             yield db
         except DBAPIError as exc:
+            if access.preference and str(exc.orig) == OWNER_ERROR:
+                raise Unsupported(OWNER_ERROR) from exc
             if rejected:
                 raise Unsupported(
                     "SQL operation outside the plugin database grant"
@@ -356,6 +380,7 @@ class PluginORM:
     def tables(self):
         prefix = (self.plugin + ".", "plugins." + self.plugin + ".")
         models = sys.modules["gsuid_core.utils.database.models"]
+        base_id = sys.modules["gsuid_core.utils.database.base_models"].BaseIDModel
         tables = {models.Subscribe.__table__, models.CoreUser.__table__}
         todo = list(SQLModel.__subclasses__())
         seen = set()
@@ -371,6 +396,9 @@ class PluginORM:
                 or cls.__module__ in (self.plugin, "plugins." + self.plugin)
             ):
                 tables.add(table)
+                columns = preference_columns(cls, table, base_id)
+                if columns:
+                    self.preferences[cls] = (table.name, columns)
         return sorted(tables, key=lambda t: t.name)
 
     async def migrate(self):

@@ -1,5 +1,6 @@
 """Bounded transport for the pinned GsCore public game-data providers."""
 
+import asyncio
 from pathlib import Path
 from functools import wraps
 from importlib import import_module
@@ -13,6 +14,8 @@ MAX_BODY = 8 * 1024 * 1024
 
 async def public_get(url, *, params=None):
     from httpx2 import AsyncClient, Response
+    from resource_broker import CLIENT, ambr_asset
+    from port_errors import Unsupported
 
     parts = urlsplit(url)
     if parts.scheme != "https" or parts.netloc not in {
@@ -22,6 +25,11 @@ async def public_get(url, *, params=None):
         "genshin.honeyhunterworld.com",
     }:
         raise ValueError("unsupported public API origin")
+    if CLIENT is not None:
+        if params or not ambr_asset(url):
+            raise Unsupported("public query is outside the static resource profile")
+        status, headers, body = await asyncio.to_thread(CLIENT.read, url, MAX_BODY)
+        return Response(status, headers=headers, content=body)
     async with AsyncClient(
         follow_redirects=False, timeout=30, trust_env=False
     ) as client:

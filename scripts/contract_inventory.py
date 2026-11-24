@@ -71,24 +71,32 @@ def consumers():
 def symbols(body, prefix=""):
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not node.name.startswith("_") or node.name in {"__init__", "__call__"}:
+            if not node.name.startswith("_") or (
+                prefix and node.name.startswith("__") and node.name.endswith("__")
+            ):
                 name = prefix + node.name
-                yield name, node.lineno, type(node).__name__
+                yield name, node, type(node).__name__
                 if isinstance(node, ast.ClassDef):
                     yield from symbols(node.body, name + ".")
         elif isinstance(node, (ast.AnnAssign, ast.Assign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 if isinstance(target, ast.Name) and not target.id.startswith("_"):
-                    yield prefix + target.id, node.lineno, "attribute"
-        elif isinstance(node, ast.ImportFrom) and not prefix:
+                    yield prefix + target.id, node, "attribute"
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and not prefix:
             for item in node.names:
-                name = item.asname or item.name
+                name = item.asname or item.name.split(".", 1)[0]
                 if not name.startswith("_"):
-                    yield name, node.lineno, "import"
-        elif isinstance(node, (ast.If, ast.Try)):
+                    yield name, node, "import"
+        elif isinstance(node, ast.TypeAlias) and not node.name.id.startswith("_"):
+            yield prefix + node.name.id, node, "type_alias"
+        elif isinstance(node, (ast.If, ast.Try, ast.TryStar)):
             yield from symbols(node.body, prefix)
             yield from symbols(node.orelse, prefix)
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                for handler in node.handlers:
+                    yield from symbols(handler.body, prefix)
+                yield from symbols(node.finalbody, prefix)
 
 
 def proof_index():
@@ -243,6 +251,17 @@ def proof_index():
             "utils.plugins_config.gs_config.StringConfig." + method
             for method in ("__init__", "get_config", "set_config", "get_raw_config")
         ],
+        "config_manager_contract": [
+            "utils.plugins_config.gs_config.ConfigSetManager." + method
+            for method in (
+                "get_config", "get_all_configs", "list_available", "exists",
+                "copy", "delete", "create_default", "drop_cache", "clear_cache",
+            )
+        ],
+        "profile_store_contract": [
+            "config.PluginConfigStore." + method
+            for method in ("get", "get_all", "set", "mark_dirty", "save", "save_dirty", "save_all")
+        ],
         "target_contract": [
             "bot.Bot.target_send",
             "bot.Bot.receive_resp",
@@ -256,19 +275,92 @@ def proof_index():
     }
 
 
+# These are the observed limits of each probe, not blanket claims about a module.
+PROBE_LIMITS = {
+    "trigger": "Registered callbacks, ordering and match samples; adapter-specific triggers need a trusted event.",
+    "layout": "Pinned ordinary and meta-plugin layouts; cross-profile imports require a host grant.",
+    "message": "Compared wire models and message segments; delivery acknowledgments depend on the adapter.",
+    "orm": "Compared private SQLite models and sessions. Owner partitions and the outermost savepoint differ.",
+    "image_tools": "Compared fixed drawing inputs, pixels and exceptions. Inputs and rendered surfaces are bounded.",
+    "mys_account": "Isolated credentials and controlled HTTP. No production login, signing issuer or service acceptance.",
+    "account_enumeration": "Compared raw lists with a private administrator grant. Ordinary production chat cannot enumerate.",
+    "mys_cache": "Compared cache inputs and response behavior in isolated processes.",
+    "mys_models": "Compared pinned model definitions. Individual game API payload variants need further tests.",
+    "subscribe": "Compared role-scoped records. End-to-end scheduled external delivery requires a target grant.",
+    "help": "Compared help drawing and output bytes. Host projection has separate size and legibility limits.",
+    "scheduler": "Compared job registration and management. See scheduler_timing_contract.py for misfires and retirement.",
+    "ai": "Disabled-AI registry behavior only. Enabled providers and live model calls remain open.",
+    "app_life": "In-process ASGI and QR form behavior. Public HTTP exposure and real accounts remain open.",
+    "sign": "Controlled external HTTP and synthetic account data. Real account actions remain untested.",
+    "mys_bbs": "Compared controlled public post responses. Production service acceptance remains open.",
+    "pool": "Generation-owned thread executor. Isolated subprocess execution remains open.",
+    "inbound_adapter": "Compared controlled adapter frames. Production YGL lacks trusted raw frames and role grants.",
+    "user_language": "Compared bound-user language and translation lookup. Other users require another grant.",
+    "minigg": "Compared controlled external responses and errors. Live availability depends on the publisher.",
+    "core_config_log": "Compared local configuration and logging. Host-wide configuration changes require host authorization.",
+    "native": "Two generations of the same self-owned test plugin. Unexercised event shapes remain open.",
+    "service": "Compared local service gates and priority. Cross-profile management requires host authorization.",
+    "binding": "Compared isolated UID lists and mutations. UID registration does not authenticate a game account.",
+    "config": "Compared profile-local configuration loading, types and persistence. Other managers require separate probes.",
+    "config_manager": "Compared profile-local config sets, file operations and cache identity. Shared host ACL is separate.",
+    "profile_store": "Compared local service switches, priority, deferred writes and migration. Input aliasing and live routing updates differ.",
+    "target": "Controlled target adapter and ordered frames. Real target authorization and receipts remain open.",
+}
+
+
+def contract_record(symbol, kind, node, probe):
+    record = {"symbol": symbol, "kind": kind, "behavior_probe": probe}
+    definition = symbol
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        definition += "(" + ast.unparse(node.args) + ")"
+        if node.returns is not None:
+            definition += " -> " + ast.unparse(node.returns)
+    elif isinstance(node, ast.ClassDef) and node.bases:
+        definition += "(" + ", ".join(map(ast.unparse, node.bases)) + ")"
+    elif isinstance(node, ast.AnnAssign):
+        definition += ": " + ast.unparse(node.annotation)
+    elif isinstance(node, (ast.Import, ast.ImportFrom, ast.TypeAlias)):
+        definition = ast.unparse(node)
+    record["native_declaration"] = definition
+    if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        documentation = ast.get_docstring(node)
+        if documentation:
+            record["native_doc_summary"] = documentation.split("\n\n", 1)[0]
+    if probe is None:
+        record["loader_status"] = "unverified"
+        record["gap"] = "No symbol-level native comparison indexed."
+    else:
+        record["loader_status"] = "sampled"
+        record["scope_and_gap"] = PROBE_LIMITS[Path(probe).stem.removesuffix("_contract")]
+    return record
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference", type=Path)
+    parser.add_argument(
+        "--contracts", action="store_true",
+        help="Emit a JSON line for each native declaration with its behavior and limits",
+    )
     args = parser.parse_args()
     sources = files(args.reference)
     uses = consumers()
     proofs = proof_index()
-    print("symbol\tkind\tsource\tline\texplicit_plugin_imports\tbehavior_probe")
+    if not args.contracts:
+        print("symbol\tkind\tsource\tline\texplicit_plugin_imports\tbehavior_probe")
     for path in sources:
         rel = path.relative_to(args.reference)
         module = ".".join(rel.with_suffix("").parts).removesuffix(".__init__")
-        for name, line, kind in [("", 1, "module"), *symbols(parse(path).body)]:
+        tree = parse(path)
+        for name, node, kind in [("", tree, "module"), *symbols(tree.body)]:
+            line = getattr(node, "lineno", 1)
             symbol = module + ("." + name if name else "")
+            if args.contracts:
+                record = contract_record(symbol, kind, node, proofs.get(symbol))
+                record.update(native_source=rel.as_posix(), line=line,
+                              fixed_plugin_imports=sorted(uses[symbol]))
+                print(json.dumps(record, ensure_ascii=False))
+                continue
             print(
                 symbol,
                 kind,

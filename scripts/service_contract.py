@@ -148,7 +148,9 @@ async def probe(mode, phase, work):
         with manage():
             plugin.close_service()
         result.append(await snapshot())
-    if mode == "native":
+    with manage():
+        from gsuid_core.config import plugin_config_store
+
         plugin_config_store.save_dirty()
     return result
 

@@ -3,7 +3,7 @@
 import base64
 import binascii
 from io import BytesIO
-from math import sqrt
+from math import ceil, sqrt
 
 from PIL import Image, ImageDraw
 
@@ -118,6 +118,8 @@ def prepare_public_parts(parts, source, package):
             single_budget=(PUBLIC_SIDE, PUBLIC_SIDE, PUBLIC_PIXELS),
         )
         remaining_pixels -= image.width * image.height
+        if len(parts) == 1 and image.height > max(1024, image.width):
+            return [_public_poster(image)]
         scale = _fit_scale(*image.size, PUBLIC_SIDE, PUBLIC_SIDE, PUBLIC_PIXELS)
         if scale == 1.0 and byte_count <= PUBLIC_BYTES:
             result.append(part)
@@ -126,6 +128,55 @@ def prepare_public_parts(parts, source, package):
     if sum(len(part.get("image", "")) for part in result) > 4 * ((MAX_BYTES + 2) // 3):
         raise UnsupportedMessage("image chain exceeds worker transport")
     return result
+
+
+def _public_poster(image):
+    # The public paginated renderer packs equal spans in row order. A tile
+    # narrower than 108 px retains the complete image without a label overlay.
+    # Resize the whole source once so adjacent tile boundaries share its pixels.
+    scale = _fit_scale(*image.size, 1536, MAX_HEIGHT, PUBLIC_PIXELS)
+    size = _scaled_size(image.size, scale)
+    frame = (
+        image if size == image.size else image.resize(size, Image.Resampling.LANCZOS)
+    )
+    width = max(400, frame.width)
+    columns = max(8, ceil(width / 96))
+    cell_width = ceil(width / columns)
+    cell_height = 128
+    rows = ceil(frame.height / cell_height)
+    if columns * rows > 1000 or rows > 64:
+        raise UnsupportedMessage("image exceeds the public page limit")
+    tiles = []
+    total = 0
+    for row in range(rows):
+        for column in range(columns):
+            x, y = column * cell_width, row * cell_height
+            if x + cell_width <= frame.width and y + cell_height <= frame.height:
+                tile = frame.crop((x, y, x + cell_width, y + cell_height))
+            else:
+                tile = Image.new("RGBA", (cell_width, cell_height))
+                if x < frame.width:
+                    tile.paste(
+                        frame.crop(
+                            (
+                                x,
+                                y,
+                                min(x + cell_width, frame.width),
+                                min(y + cell_height, frame.height),
+                            )
+                        ),
+                        (0, 0),
+                    )
+            stream = BytesIO()
+            tile.save(stream, format="PNG")
+            data = stream.getvalue()
+            total += len(data)
+            if total > MAX_BYTES:
+                raise UnsupportedMessage(
+                    "lossless public image tiles exceed the worker transport"
+                )
+            tiles.append(base64.b64encode(data).decode("ascii"))
+    return {"poster": {"width": frame.width, "height": frame.height, "tiles": tiles}}
 
 
 def _wrap_text(text, font, width):

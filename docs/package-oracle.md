@@ -2,6 +2,40 @@
 
 ## 整包模式的 WebChat 收件
 
+### 候选 10
+
+冻结包 `76010c98061d291be30761d82c02fb83bd4d2f755e92a88fae36c29a883fc292` 允许上游通过普通 HTTP 客户端读取声明的公开静态素材，并能在模块就绪后继续下载启动时已请求的批次。核对实际运行的三个 profile、worker 摘要以及独立空目录的整包注册结果，服务、回调和触发器数量与表中原生值一致。是否已取得某个具体素材须逐文件核实。
+
+| 验收 | 观察 |
+| --- | --- |
+| 星铁 `sr绑定UID000000619` | #1149 实收成功，私有库确实写入本测试用户提交的星铁 UID。 |
+| 原神 `gs胡桃攻略`、鸣潮 `ww套装列表1.0` | #1151 未收胡桃图，#1153 为暂无数据。独立加测星铁光锥攻略 #1155 和鸣潮迅刀列表 #1157 也未收图。现场缺少所需攻略图及鸣潮的详细 JSON。相同资源条件下的原生回调也没有生成这些业务图。 |
+| 已见三路回归与多页投递 | #1159、#1161、#1163 分别与原星铁图、原神图和鸣潮正文相同。原神帮助 #1165–1167 的三页附件与候选 9 对应页面逐字节相同。私聊大图和普通用户账户枚举仍受到投递与权限限制。 |
+| 补抽原神 `gs绑定帮助` | #1177 实收完整用户手册。去掉宿主标题后，641 个字符与五段固定原文按原顺序拼接的结果完全相同，包括末尾换行。只校验文档收件。 |
+| 补抽鸣潮 `ww查看权重` | 有效 UID 前置 #1173 失败，#1175 提示先绑定。已授权普通 UID 的会话尝试通过插件定义的 `Bind` 子类写入时遭 ORM 拒绝。此轮权重查询未进入实际业务分支。 |
+
+首抽三项通过一项，独立加测两项均未通过。另一项预登记的原神每日材料有真实星期条件，测试当日未运行。补抽结果保留各自的判定。
+
+### 候选 9
+
+三个固定包从各自全新目录启动。受限公开素材传输允许原版插件下载素材，普通游戏 API 网络、真实账户及共享资料均未提供。候选包 SHA-256 为 `a2494cd07bc30a43818d4c6bc3c1f56a7cf010784b020185e8d34f1599f89ce8`。
+
+| 项目 | 实际结果 |
+| --- | --- |
+| 新星铁回调 | 私聊添加一个测试别名后，`sr删除丹恒别名列车青龙验收` 在 #1107 返回删除确认。添加、删除使用不同的上游回调。 |
+| 新原神回调 | `gs参考面板 火` 在 #1109 未收图。相同缺图条件下原生只写诊断。另用实际公开火图在独立目录对照，两端回调读到同一份 1080 × 10873 JPEG。Loader 私聊投影把原图和文字选项合为 545 × 5530 PNG。 |
+| 新鸣潮回调 | `ww散华别名` 在 #1111 未收图。相同缺少公共角色表时，两端都回复找不到角色。另在独立目录提供从发布方实际取得的别名表，两端都生成 600 × 315 图片，散华、sh、三华、三花、凌华五个标签齐全。 |
+| 已见的三路回归 | 星铁别名图 #1113、原神伤害乘区图 #1115 与前次附件逐字节相同。鸣潮 45 行指南 #1117 与前次正文逐字相同。 |
+| 已见的长图 | 原神公开帮助按源顺序输出三页。#1119、#1120、#1121 的三个持久附件分别为 1,472,881、1,216,437、833,092 字节。WebChat 流与会话历史的三对 SHA-256 均相同。源内容在原版和 Loader 的相同环境中生成同一份 2970 × 5584 JPEG。 |
+| 已见的写入操作 | 原神测试 UID 在 #1123 登记成功并留下单行绑定。同用户的 #1125 随后进入订阅路径并被拒绝，未建立外部账户动作。鸣潮 #1127 返回语言已设为 en，当前用户的私有语言表有且仅有一行 en。 |
+| 停用、重载和回退 | 停用时 #1131、#1133、#1135 均无游戏回件。三路达到 loaded 后，#1137、#1139、#1141 各有一次正确回件。回到旧包后，#1143、#1145、#1147 仍与基准附件或正文一致。 |
+
+图片补料实验单独运行，原先盲测仍为 1/3。真实用户收件与原生生成图的渲染尺寸由公开输出接口决定，文档中的尺寸分别对应其实际阶段。
+
+### 候选 8
+
+自有测试插件经过固定原生与 Core 0.2.11 SDK 加载的 Worker，各运行两个代际、共 13 个输入。两个受限身份的区别保留在比较结果里：原生按测试配置给 master 授权，正式 Loader 只能使用由宿主确认的身份。受控目标适配器的队列对照和真实 WebChat 持久收件分别记录。
+
 候选 8 使用 `--fresh-data --offline` 构建。安装前按三个归档、私有解释器、worker 和空资料目录封存，安装后核对实际运行的三个 worker。下表记录本机 WebChat 保存的回复编号。测试未使用真实游戏账户。
 
 | 输入 | 候选 8 实收 |
@@ -111,3 +145,37 @@ SQLite 实际执行的指令解释了首个保存点的差异。原生默认连�
 若要在两侧保留完整的外层回滚，同样的显式 BEGIN 策略在隔离原生引擎上已验证可行。若改为复刻原生遗留行为，则需让驱动重新决定何时开始事务，影响还包括 DDL 和连续读取。纯 sqlite3 的双连接 WAL 对照中，驱动默认模式下建表后回滚仍留表，前后两次 SELECT 能看到期间另一连接的提交；显式 BEGIN 下建表可回滚，两次 SELECT 保持同一读视图。这里没有调整产品事务策略，也没有测量两种策略的性能。
 
 从原生 3.12.10 环境运行 `scripts/sqlite_transaction_contract.py --freeze .sayu-local/freeze-8.json --profile starrail --output .sayu-local/receipts/freeze8-sqlite-transactions-trace.json`。脚本校验冻结 Worker 与依赖哈希，只使用新建的临时数据库。回执同时保存真实 SQLite 执行轨迹、可见行和重开结果；早先未加跟踪器的同候选回执单独保留。
+
+## 插件配置集、迁移与刷盘
+
+使用 Python 3.12.10，对固定 GsCore `96cd7353be3100ff982bccc33e554961837c778e` 的 1,592 个已校验文件和星铁 Worker `2afa19ef08d19d8a4e593ee2218385864b8a8508adce1b8965c2a8b94f91bd3e` 分别运行相同输入。14 组共有观察全部一致。
+
+| 公开操作 | 原生与 Loader 的实测结果 |
+| --- | --- |
+| `ConfigSetManager` 创建、枚举、删除 | 构造管理器不创建目录。首次创建成功，再次创建返回 false。枚举按名字排序，删除不存在的项返回 false。覆盖路径和枚举方法的子类可管理嵌套目录里的配置文件。 |
+| `copy` | 直接从磁盘复制，目标字节保留原始缩进、换行和合成的 secret 字段。复制成功返回 None。空目标、同名、加号、缺失源和已存在目标返回相同的原生错误文案。 |
+| `get_config`、`drop_cache`、`clear_cache` | 同一管理器命中缓存时继续返回现有对象。清缓存后重新读取磁盘，具有相同全名的 `StringConfig` 保留对象身份。相同管理器类、后缀和配置名在同一 profile 的另一目录重开会将该对象重绑到新路径。不同后缀产生独立对象。 |
+| `StringConfig` 路径及字段迁移 | 目标缺失时迁移列表中第一个存在的旧文件，其余文件保留。目标已存在时优先使用它。无法按 UTF-8 读取的旧文件原样保留，新位置写入默认值。`migrate_from([left, right])` 最后采用 right 的重名值，保留新字段的标题，两份旧文件都移除已迁出的字段。 |
+| 刷盘 | 直接修改字段的 `data` 仅影响内存。调用框架 `core_config.lazy_write_config()` 后，此字段的磁盘内容仍为初始值。调用该实例的 `write_config()` 才保存，`set_config()` 则立即保存。以上操作两侧均新增 0 个调度作业。固定原生未给插件的 `StringConfig` 安装周期刷盘任务。 |
+
+原生另有 `gsuid_core.config.plugin_config_store`，服务注册使用该对象保存插件及其 SV 配置。`set` 更新内存并标记脏项。`get` 和 `get_all` 返回缓存引用，直接修改其中的值需要再调用 `mark_dirty`，才会被 `save_dirty` 写入。`save(name)` 立即写指定项，`save_all()` 连同未标脏的缓存一起写入。实际用样本值 1、2、3 依次观察，框架 `lazy_write_config` 后为 1，直接改成 2 后仅调用 `save_dirty` 仍为 1，标脏后保存为 2，将值改为 3 后调用 `save_all` 保存为 3。原生 `GsServer.load_plugins` 在扫描结束后调用 `save_all` 和 `lazy_write_config`。原生旧版框架数据 `config.json["plugins"]` 导入时会先备份配置、保留已有的逐插件文件、写入缺失文件，最后移除旧键。合成旧配置验证了这四项。
+
+| 框架设置 | Loader 的已有接口和差异 |
+| --- | --- |
+| 当前插件和 SV 的 `enabled`、`priority` | 注册对象、`gsuid_core.sv.config_plugins`、`plugin_config_store` 共用本代际的服务状态。`Plugins.set`、`SV.set` 和 `SV.enable/disable` 立即改变分发状态，默认标脏，`is_lazy=False` 则提交本 profile 的 `services.sqlite3`。既有库中的开关及优先级可恢复。 |
+| `plugin_config_store.get/get_all/set/mark_dirty/save/save_dirty/save_all` | `get` 与 `get_all` 返回同一受控映射，嵌套 `sv` 也保留引用。授权范围内的直接修改更新内存，`set` 还会标脏。`save`、`save_all` 立即提交，`save_dirty` 和框架 `lazy_write_config` 只提交脏项。可信的包扫描完成后保存当前状态。 |
+| 旧 profile 数据 | 当前 profile 下 `plugins_configs/<当前插件>.json` 优先于旧 `config.json["plugins"]`，已持久化的 Loader 设置优先。Loader 将接受的字段写入 SQLite，保留原逐插件文件；旧总配置在 SQLite 提交后备份并移除旧键，其他框架键保留。旧键含外部插件或含不支持的字段时，迁移显式报错并保留源数据。 |
+| 前缀、别名、作用范围 | Loader 可读取注册时声明的字段。当前服务设置写接口仅接受开关和优先级。路由元数据的动态更新属于 Loader 的路由能力，须同时更新实际分发状态。 |
+| 权限和名单 | 隔离适配器可用可信事件身份执行声明的 `pm`、用户/群及 bot 名单。正式入口想按真实角色、群成员或 bot 身份匹配，需要宿主提供相应的可信字段。运行时修改访问策略还需要可信管理授权，未授权回调不能通过配置字典提升权限。 |
+
+Loader 把同名配置注册表限定在当前 profile，普通事件只能读取值。配置集复制、删除、迁移及缓存清除需要有效管理授权。目录外路径、硬链接文件和目录递归删除被拒绝。独立测试还验证了 20 个竞争复制请求只发布一份完整文件，以及复制或迁移在发布前失败时保留源文件。
+
+配置集通过同目录的独占改名发布完整文件。Windows 使用其原生改名，Linux 使用 `renameat2(RENAME_NOREPLACE)`，macOS 使用 `renamex_np(RENAME_EXCL)`。两个 POSIX 分支在调用 libc 前均将相同路径交给实际的 `os.rename` 审计钩子，普通硬链接仍被拒绝。缺少独占改名符号或文件系统不支持时，错误传回调用方，已存在目标保留。参数来自 [Linux 文件系统接口](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h) 和 [Darwin 系统接口](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stdio.h)。
+
+`tests/test_config_publication.py` 在 Windows Python 3.12.10 使用真实写入 guard 验证了公开配置复制和迁移，24 个独立暂存文件竞争同一路径时，1 个成功、23 个保留各自的暂存内容。同一用例用 libc 替身覆盖了两个 POSIX 分支的参数、目标冲突、缺失符号、文件系统不支持及 guard 拒绝。Debian WSL2 的实际 Linux 6.6.87.2 内核和 glibc 另以 C 对照验证了首次成功、再次调用返回 `EEXIST`、已有目标和第二份源文件内容均保留。该 Debian 环境未安装 Python；Linux 完整 Worker 和 macOS 原机运行尚未验证。
+
+前次星铁 Worker `2afa19ef…` 尚未导出 `plugin_config_store`，且 `SV.set(is_lazy=True)` 会立即提交。接通框架存储后的归档 `222a846858c17117604104cee4a460a01931255e0ce57df01d80c1b68c74f54f` 用两种旧配置布局各核对 11 组观察，均与固定原生一致。真实注册的 SV 从优先级 5 改为 11 时，默认写法让内存先变为 11、磁盘仍为 5。显式保存后再用 `is_lazy=False` 改为 4，两侧磁盘都立即变为 4。在存储边界注入写入失败，两侧均上抛 `OSError`、原盘值保持 9，移除故障后再次刷新脏项都成功写入 8。同一双代际分发夹具验证了重新注册后开关、优先级及六组权限判断。
+
+两个原生行为与 Loader 的约束不同。原生直接保留传给 `set` 的可变字典，Loader 在授权时复制入参，避免调用方持有普通字典在授权到期后写入。Loader 对外返回实现 `MutableMapping` 的视图，保留 `get` 与 `get_all` 的引用关系；需要原生 JSON 字典的调用方可逐层转换映射。原生直接修改服务配置字典时，已注册 SV 的布尔属性仍保留旧值；Loader 将同一修改同步到实际分发对象。直接编辑缓存都需要另行标脏才能由 `save_dirty` 持久化。过期代际、跨 profile 访问、未授权写入及 ACL 字段都抛出受限错误。并发代际遇到其他已提交的不同值时保存失败，保留已提交的数据。
+
+配置集复测可在原生环境运行 `scripts/config_manager_contract.py --reference .sayu-local/reference --output .sayu-local/receipts/config-manager-final-native.json`，再在当前星铁环境运行 `scripts/config_manager_contract.py --output .sayu-local/receipts/config-manager-final-loader.json --compare .sayu-local/receipts/config-manager-final-native.json`。框架存储用 `scripts/profile_store_contract.py` 同样分两次执行，分别指定原生源及回执、Worker 回执及 `--compare`。专用测试位于 `tests/test_config_manager.py` 和 `tests/test_profile_service_store.py`。原有 18 种配置类型与迁移比对可继续使用 `scripts/config_contract.py`。

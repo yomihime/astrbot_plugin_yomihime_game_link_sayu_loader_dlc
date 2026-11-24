@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import zipfile
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -39,7 +40,8 @@ async def check(core, cases, list_commands=False):
         assert output.text.startswith(prefix)
         return output.text[len(prefix) :]
 
-    with tempfile.TemporaryDirectory(prefix="sayu-check-") as temp:
+    async with AsyncExitStack() as cleanup:
+        temp = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="sayu-check-"))
         with zipfile.ZipFile(ROOT / "dist" / (ROOT_NAME + ".zip")) as candidate:
             release = protocol.parse_release(candidate.read("release.json"))
             for row in release["files"]:
@@ -81,6 +83,7 @@ async def check(core, cases, list_commands=False):
                 importlib.import_module("sayu_loader." + mod), factory
             )().create(None)
             await instance.start()
+            cleanup.push_async_callback(instance.stop)
             ports = instance.handlers().capabilities
             assert set(ports) == {cmd.capability_id for cmd in meta.commands}
             modules[route] = instance
@@ -202,6 +205,39 @@ async def check(core, cases, list_commands=False):
         # Exercise the owner transport against the same upstream JPEG. The public
         # card path retains the original bytes; the private path requires a PNG.
         genshin = modules["sayugs"]
+        private_handler = genshin.handlers().capabilities["direct"]
+        uid = "000007319"
+        command = {"text": f"gs绑定UID{uid}"}
+        issued = sdk.InvocationView(
+            "uid-fixture",
+            sdk.InvocationOrigin.COMMAND,
+            "sample-user",
+            "sample-dm",
+            "sayugs",
+            1,
+            1,
+            adapter_id="fixture",
+            capability_id="direct",
+        )
+        bound = AsyncMock(return_value=SimpleNamespace(invocation=issued))
+        with patch.object(
+            genshin, "services", SimpleNamespace(scopes=SimpleNamespace(bind=bound))
+        ):
+            for expected in (f"绑定UID{uid}成功！", f"UID{uid}已经绑定过了！"):
+                result = validate(await private_handler.invoke(issued, command))
+                assert result.status is sdk.ResultStatus.SUCCESS
+                assert await rendered_text(result.document) == expected
+            assert bound.await_count == 2
+            bound.return_value = SimpleNamespace(invocation=None)
+            try:
+                await private_handler.invoke(issued, command)
+            except sdk.AccessDenied:
+                pass
+            else:
+                raise AssertionError("accepted a scope with a different invocation")
+            forged = await public.invoke(None, {**command, "owner_action": True})
+            assert forged.status is sdk.ResultStatus.ERROR
+            assert bound.await_count == 3
         direct = await genshin.exchange(
             {
                 "text": cases["sayugs"][0],

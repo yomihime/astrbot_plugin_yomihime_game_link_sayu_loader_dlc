@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import Counter, deque
+from dataclasses import dataclass, field
 from hashlib import sha256
 from http.client import HTTPException, IncompleteRead
 import ssl
@@ -11,7 +12,7 @@ import json
 from pathlib import PureWindowsPath
 from urllib.parse import quote, unquote, urlsplit
 
-from port_errors import OfflineNetwork, Unsupported
+from port_errors import OfflineNetwork, StartupTransferLimit, Unsupported
 
 # HTTPS entries in the pinned native gsuid_core/utils/download_resource/download_core.py.
 # The other native speed-test entries use plain HTTP.
@@ -76,6 +77,30 @@ class _Index(HTMLParser):
         self.rows = []
 
 
+@dataclass
+class _Batch:
+    roots: deque
+    prefix: str
+    base: str
+    pending: list = field(default_factory=list)
+    entries: int = 0
+    pages: int = 0
+    bytes: int = 0
+    failed_reads: int = 0
+    published_files: int = 0
+    published_bytes: int = 0
+    state: str = "queued"
+
+    def inventory(self):
+        return {
+            "state": self.state,
+            "pending_roots": len(self.roots),
+            "failed_reads": self.failed_reads,
+            "published_files": self.published_files,
+            "published_bytes": self.published_bytes,
+        }
+
+
 class Mirror:
     def __init__(self, port, bases, owner):
         self.port = port
@@ -89,6 +114,8 @@ class Mirror:
         self._selection_lock = asyncio.Lock()
         self._selected = None
         self._probed = False
+        self._continuations = {}
+        self._runner = None
 
     def diagnostics(self):
         return {
@@ -96,6 +123,7 @@ class Mirror:
             "bytes_written": self.bytes_written,
             "failures": list(self.failures),
             "omitted_failures": self.omitted_failures,
+            "continuations": [b.inventory() for b in self._continuations.values()],
         }
 
     def _failed(self, stage, url, reason, status=None):
@@ -168,11 +196,22 @@ class Mirror:
                 # A mirror failing authorization or integrity cannot be selected;
                 # its denial must propagate independently of other candidates.
                 for row in rows:
-                    if isinstance(row, BaseException):
+                    if isinstance(row, BaseException) and not isinstance(
+                        row, StartupTransferLimit
+                    ):
+                        raise row
+                for row in rows:
+                    if isinstance(row, StartupTransferLimit):
                         raise row
                 usable = [r for r in rows if r is not None]
                 self._selected = min(usable)[1] if usable else None
-                self._probed = True
+                from resource_broker import CLIENT
+
+                # A short startup probe is not conclusive for later user-initiated
+                # refreshes, which have the normal public transport budget.
+                self._probed = (
+                    bool(self._selected) or CLIENT is None or CLIENT.budget is None
+                )
             return self._selected
 
     async def download_all_file(self, plugin_name, EPATH_MAP, URL=None, TAG=None):
@@ -184,6 +223,8 @@ class Mirror:
             self._failed("authorization", "", "origin_denied")
             raise Unsupported("unapproved resource mirror")
         endpoints = []
+        if len(EPATH_MAP) > 64:
+            raise Unsupported("resource root limit exceeded")
         for endpoint, folder in EPATH_MAP.items():
             try:
                 path = self.port.directory(folder)
@@ -202,30 +243,128 @@ class Mirror:
                 self._failed("directory", "/" + label, type(exc).__name__)
                 raise
             endpoints.append((route, path))
-        if not URL:
-            base = await self._default()
+        from resource_broker import CLIENT, transfer_window
+
         prefix = "/" + quote(segment(plugin_name)) + "/"
-        budget = {"entries": 0, "bytes": 0, "pages": 0}
+        key = (base, frozenset(endpoints))
+        if (
+            CLIENT is not None
+            and CLIENT.budget is not None
+            and key in self._continuations
+        ):
+            return None
+        batch = _Batch(deque(endpoints), prefix, base)
         try:
-            async with asyncio.timeout(45):
-                for route, path in endpoints:
-                    url = (base or "") + prefix + route + "/"
-                    if base:
-                        await self._sync(url, path, budget, 0)
-                    else:
-                        self._failed("index", url, "no_available_mirror")
+            with transfer_window() as deadline:
+                async with asyncio.timeout(45):
+                    await self._run(batch, deadline)
+        except StartupTransferLimit:
+            self._failed("batch", prefix, "startup_budget_exhausted")
+            for route, _ in batch.roots:
+                self._failed(
+                    "index", (base or "") + prefix + route + "/", "startup_incomplete"
+                )
+            if CLIENT is not None and CLIENT.budget is not None and batch.roots:
+                if len(self._continuations) < 4:
+                    self._continuations.setdefault(key, batch)
+                else:
+                    self._failed("batch", prefix, "continuation_capacity")
+            return None
         except TimeoutError as exc:
             self._failed("batch", prefix, "deadline_exceeded")
             raise Unsupported(
                 "resource synchronization exceeded its time limit"
             ) from exc
 
-    async def _sync(self, url, folder, budget, depth):
-        budget["pages"] += 1
-        if budget["pages"] > 32 or depth > 3:
+    def start_continuations(self):
+        if self._runner is None and self._continuations:
+            self._runner = asyncio.create_task(self._resume())
+
+    async def stop_continuations(self):
+        if self._runner is not None:
+            self._runner.cancel()
+            await asyncio.gather(self._runner, return_exceptions=True)
+        for batch in self._continuations.values():
+            if batch.state in ("queued", "running"):
+                batch.state = "cancelled"
+
+    async def _resume(self):
+        # One runner per generation, at most four original 32 MiB batches.
+        # The wall limit bounds the entire queue, including mirror selection.
+        end = monotonic() + 60
+        for batch in self._continuations.values():
+            if monotonic() >= end:
+                self._failed("continuation", batch.prefix, "deadline_exceeded")
+                batch.state = "partial"
+                continue
+            batch.state = "running"
+            try:
+                async with asyncio.timeout(min(45, end - monotonic())):
+                    await self._run(batch, None)
+            except asyncio.CancelledError:
+                batch.state = "cancelled"
+                raise
+            except TimeoutError:
+                self._failed("continuation", batch.prefix, "deadline_exceeded")
+                batch.state = "partial"
+            except Exception as exc:
+                self._failed("continuation", batch.prefix, type(exc).__name__)
+                batch.state = "failed"
+            else:
+                batch.state = "partial" if batch.failed_reads else "completed"
+
+    async def _run(self, batch, deadline):
+        if not batch.base:
+            batch.base = await self._default()
+        while batch.roots:
+            route, path = batch.roots[0]
+            url = (batch.base or "") + batch.prefix + route + "/"
+            if not batch.base:
+                self._failed("index", url, "no_available_mirror")
+                batch.failed_reads += 1
+            else:
+                if not batch.pending:
+                    batch.pending.append((url, path, 0, None, None))
+                # Keep the interrupted item and its unvisited siblings. Neither
+                # completed files nor already-observed failures are re-requested.
+                while batch.pending:
+                    if deadline is not None and monotonic() >= deadline:
+                        raise StartupTransferLimit("startup transfer budget exhausted")
+                    parent, folder, depth, href, length = batch.pending[-1]
+                    folder = self.port.directory(folder)
+                    if href is None:
+                        children = await self._index(parent, folder, batch, depth)
+                        batch.pages += 1
+                    else:
+                        try:
+                            children = await self._entry(
+                                parent, folder, batch, depth, href, length
+                            )
+                        except (
+                            PermissionError,
+                            ssl.SSLError,
+                            Unsupported,
+                            ValueError,
+                            OSError,
+                        ) as exc:
+                            self._failed(
+                                "entry",
+                                parent + quote(href, safe=""),
+                                type(exc).__name__,
+                            )
+                            raise
+                        batch.entries += 1
+                    batch.pending.pop()
+                    if children:
+                        batch.pending.extend(reversed(children))
+            batch.roots.popleft()
+
+    async def _index(self, url, folder, batch, depth):
+        if batch.pages >= 32 or depth > 3:
             raise Unsupported("resource directory limit exceeded")
         listing = await self._resource("index", url, 256 * 1024)
         if listing is None:
+            batch.failed_reads += 1
             return
         page = _Index()
         try:
@@ -236,37 +375,27 @@ class Mirror:
         page.close()
         if not page.listing:
             self._failed("index", url, "no_index")
+            batch.failed_reads += 1
             return
         if not page.done:
             self._failed("index", url, "incomplete_index")
             raise ValueError("incomplete static resource index")
         folder.mkdir(parents=True, exist_ok=True)
-        for href, length in page.entries:
-            try:
-                await self._entry(url, folder, budget, depth, href, length)
-            except (
-                PermissionError,
-                ssl.SSLError,
-                Unsupported,
-                ValueError,
-                OSError,
-            ) as exc:
-                self._failed("entry", url + quote(href, safe=""), type(exc).__name__)
-                raise
+        if len(page.entries) > 1024:
+            raise Unsupported("resource entry limit exceeded")
+        return [(url, folder, depth, href, length) for href, length in page.entries]
 
-    async def _entry(self, url, folder, budget, depth, href, length):
+    async def _entry(self, url, folder, batch, depth, href, length):
         directory = href.endswith("/")
         # Resolve only a plain immediate child. Never request href itself.
         name = segment(unquote(href[:-1] if directory else href))
         child = url + quote(name)
-        budget["entries"] += 1
-        if budget["entries"] > 1024:
+        if batch.entries >= 1024:
             raise Unsupported("resource entry limit exceeded")
         if directory and length == "-":
-            await self._sync(
-                child + "/", self.port.directory(folder / name), budget, depth + 1
-            )
-            return
+            return [
+                (child + "/", self.port.directory(folder / name), depth + 1, None, None)
+            ]
         if directory or not length.isascii() or not length.isdecimal():
             return
         size = int(length)
@@ -274,11 +403,12 @@ class Mirror:
         if target.is_file() and size and target.stat().st_size == size:
             self.counts["unchanged"] += 1
             return
-        budget["bytes"] += size
-        if size > 8 * 1024 * 1024 or budget["bytes"] > 32 * 1024 * 1024:
+        if size > 8 * 1024 * 1024 or batch.bytes + size > 32 * 1024 * 1024:
             raise Unsupported("resource mirror byte limit exceeded")
         data = await self._resource("file", child, size)
+        batch.bytes += size
         if data is None:
+            batch.failed_reads += 1
             return
         if len(data) != size:
             self._failed("file", child, "size_mismatch")
@@ -287,6 +417,18 @@ class Mirror:
             json.loads(data)
         else:
             await asyncio.to_thread(self.port._image, data)
+        # An atomic file publication already in progress must settle before
+        # retirement can release the private generation's storage lock.
+        write = asyncio.create_task(self._publish(target, data, batch))
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            await write
+            raise
+
+    async def _publish(self, target, data, batch):
         await asyncio.to_thread(self.port._write, target, data)
         self.bytes_written += len(data)
         self.counts["downloaded"] += 1
+        batch.published_files += 1
+        batch.published_bytes += len(data)
