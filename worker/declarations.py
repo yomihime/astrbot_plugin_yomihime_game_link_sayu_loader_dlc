@@ -8,8 +8,7 @@ import importlib.util
 from types import CodeType
 
 
-class Unsupported(ValueError):
-    """A declaration requires a capability outside this worker."""
+from port_errors import Unsupported
 
 
 BUILTINS = {

@@ -3,37 +3,52 @@
 import base64
 import binascii
 import asyncio
-import logging
-import re
 import sys
+import uuid
 from collections import Counter, deque
 from contextlib import contextmanager
-from dataclasses import dataclass
-from functools import wraps
+from copy import deepcopy
 from io import BytesIO
 from os import PathLike
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
-from plugin_settings import MODELS, configuration_type
+from plugin_settings import install_settings
+from plugin_image_tools import install_image_tools
+from plugin_help import install_help
+from plugin_image_fetch import install_image_fetch
+from plugin_data_store import install_data_store
+from plugin_downloads import install_downloads
+from plugin_i18n import install_i18n
+from plugin_core_config import install_core_config
+from plugin_logger import install_logger
+from plugin_minigg import install_minigg
+from plugin_public_api import install_public_api
+from plugin_public_http import PublishedImages
+from plugin_messages import (
+    Button,
+    ButtonType,
+    ButtonList,
+    Event,
+    Message,
+    MessageReceive,
+    MessageSend,
+)
 from service_settings import ServiceSettings
-from declarations import Unsupported
+from plugin_app_life import install_app_life
+from plugin_ai import install_ai
+from plugin_qrlogin import install_qrlogin
+from plugin_status import install_status
+from plugin_pool import install_pool
+from plugin_user_language import bot_get_lang, bot_t
+import plugin_trigger
+import plugin_text_image
+from port_errors import Unsupported
 from target_transport import UnsupportedMessage, file_payload
 
 
 class NoMatch(LookupError):
     """No available service accepts this command and conversation."""
-
-
-@dataclass
-class Route:
-    service: object
-    mode: str
-    keyword: str
-    pattern: object
-    handler: object
-    prefix: str
-    block: bool
 
 
 _routes = []
@@ -44,20 +59,10 @@ _prefix = ""
 _plugin = ""
 _data_root = None
 _source = None
-_ranks = {
-    "fullmatch": 0,
-    "command": 1,
-    "prefix": 2,
-    "suffix": 2,
-    "regex": 3,
-    "keyword": 4,
-}
 MAX_INPUT_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_INPUT_PIXELS = 12_000_000
 _MAX_TEXT = 4096
 _MAX_PARTS = 32
-_GAPS = " \t\u3000\u00a0"
-_GAP_PATTERN = "[" + _GAPS + "]"
 
 
 def package(name, directory=None):
@@ -84,8 +89,8 @@ def registration_scope():
 def registration_counts():
     """Counts of distinct services and handlers, including multiple aliases per handler."""
     return {
-        "services": len({id(route.service) for route in _routes}),
-        "handlers": len({route.handler for route in _routes}),
+        "services": len({id(route.sv) for route in _routes}),
+        "handlers": len({route.func for route in _routes}),
         "triggers": len(_routes),
     }
 
@@ -94,36 +99,15 @@ def registered_triggers():
     """List registrations without invoking game code or inspecting any user data."""
     return [
         {
-            "service": route.service.name,
-            "handler": route.handler.__module__ + "." + route.handler.__qualname__,
-            "mode": route.mode,
+            "service": route.sv.name,
+            "handler": route.func.__module__ + "." + route.func.__qualname__,
+            "mode": route.type,
             "pattern": route.keyword,
             "prefix": bool(route.prefix),
-            "area": route.service.area,
+            "area": route.sv.area,
         }
         for route in _routes
     ]
-
-
-def _literal_pattern(keyword):
-    # Gaps at Han/ASCII boundaries are optional, spaces within a word are required.
-    pieces = []
-    previous = ""
-    for char in keyword:
-        if char in _GAPS:
-            if not previous or previous not in _GAPS:
-                pieces.append(_GAP_PATTERN + "+")
-        else:
-            if previous and previous not in _GAPS:
-                han = "\u3400" <= char <= "\u9fff"
-                prev_han = "\u3400" <= previous <= "\u9fff"
-                if (han and previous.isascii() and previous.isalnum()) or (
-                    prev_han and char.isascii() and char.isalnum()
-                ):
-                    pieces.append(_GAP_PATTERN + "*")
-            pieces.append(re.escape(char))
-        previous = char
-    return "".join(pieces)
 
 
 def check_redeclaration(instance, options):
@@ -134,34 +118,67 @@ def check_redeclaration(instance, options):
                 raise Unsupported("conflicting permission declarations for one name")
 
 
+class SVList:
+    def __init__(self):
+        self.lst = {}
+        self.plugins = {}
+        self.detail_lst = {}
+
+    @property
+    def get_lst(self):
+        return self.lst
+
+
 class SV:
-    def __new__(cls, name="", **kwargs):
+    def __new__(cls, name="", *args, **kwargs):
+        if name is None:
+            raise ValueError("SV.name is None!")
         if _service_store is not None and name in _services:
-            check_redeclaration(_services[name], kwargs)
+            positional = dict(
+                zip(
+                    (
+                        "pm",
+                        "priority",
+                        "enabled",
+                        "area",
+                        "black_list",
+                        "white_list",
+                        "aside",
+                    ),
+                    args,
+                )
+            )
+            check_redeclaration(_services[name], {**positional, **kwargs})
             return _services[name]
         return super().__new__(cls)
 
     def __init__(
         self,
         name="",
-        *,
         pm=6,
         priority=5,
-        area="ALL",
         enabled=True,
+        area="ALL",
         black_list=(),
         white_list=(),
+        aside=None,
         **options,
     ):
         if options:
             raise Unsupported("unsupported service options")
         if getattr(self, "_initialized", False):
+            if aside is not None:
+                self.aside = aside
             return
         self.name = name
         self.pm = pm
         self.priority = priority
         self.area = area
         self.enabled = enabled
+        self.aside = aside
+        self.TL = {}
+        self.self_plugin_name = _plugin
+        self.white_list, self.black_list = list(white_list), list(black_list)
         self._restrictions = {
             "pm": pm,
             "area": area,
@@ -172,6 +189,12 @@ class SV:
         if _service_store is not None:
             _service_store.restore("service", self)
             _services[name] = self
+            self.plugins = _plugin_settings.get(_plugin) or Plugins(
+                _plugin, force_prefix=[_prefix] if _prefix else []
+            )
+            sys.modules["gsuid_core.sv"].SL.detail_lst.setdefault(
+                self.plugins, []
+            ).append(self)
         self._initialized = True
 
     def set(self, is_lazy=True, **changes):
@@ -189,15 +212,17 @@ class SV:
         self,
         mode,
         commands,
-        *,
         block=False,
-        prefix=True,
         to_me=False,
+        prefix=True,
         to_ai="",
+        covers=None,
+        aliases=None,
+        aside=None,
         **options,
     ):
         def decorate(handler):
-            if to_me or options or (_service_store is not None and to_ai):
+            if options:
                 raise Unsupported("unsupported trigger options")
             if _service_store is None and (not self.enabled or self._acl_blocked):
                 raise Unsupported("restricted service")
@@ -205,79 +230,101 @@ class SV:
             for word in dict.fromkeys(words):
                 if not isinstance(word, str) or not word:
                     raise ValueError("invalid trigger keyword")
-                expression = (
-                    word
-                    if mode == "regex"
-                    else re.escape(word)
-                    if mode == "keyword"
-                    else _literal_pattern(word)
-                )
-                if mode == "suffix":
-                    expression += r"\Z"
                 settings = _plugin_settings.get(_plugin)
                 prefixes = settings.prefixes if settings else (_prefix,)
-                for literal_prefix in prefixes if prefix and prefixes else ("",):
-                    _routes.append(
-                        Route(
-                            self,
-                            mode,
-                            word,
-                            re.compile(expression),
-                            handler,
-                            literal_prefix,
-                            block,
-                        )
+                prefixed = (
+                    prefix and prefixes and mode not in {"message", "meta", "file"}
+                )
+                for literal_prefix in prefixes if prefixed else ("",):
+                    route = plugin_trigger.Trigger(
+                        mode, word, handler, literal_prefix, block, to_me, aside, self
                     )
+                    route.ai_description = to_ai
+                    route.covers = covers
+                    route.aliases = aliases
+                    plugin_trigger.bump_registry_version()
+                    table = self.TL.setdefault(mode, {})
+                    key = literal_prefix + word
+                    if key in table:
+                        _routes.remove(table[key])
+                    table[key] = route
+                    _routes.append(route)
             return handler
 
         return decorate
 
-    def on_command(self, commands, **options):
-        return self.register("command", commands, **options)
+    def on_command(self, commands, *args, **options):
+        return self.register("command", commands, *args, **options)
 
-    def on_fullmatch(self, commands, **options):
-        return self.register("fullmatch", commands, **options)
+    def on_fullmatch(self, commands, *args, **options):
+        return self.register("fullmatch", commands, *args, **options)
 
-    def on_prefix(self, commands, **options):
-        return self.register("prefix", commands, **options)
+    def on_prefix(self, commands, *args, **options):
+        return self.register("prefix", commands, *args, **options)
 
-    def on_suffix(self, commands, **options):
-        return self.register("suffix", commands, **options)
+    def on_suffix(self, commands, *args, **options):
+        return self.register("suffix", commands, *args, **options)
 
-    def on_regex(self, commands, **options):
-        return self.register("regex", commands, **options)
+    def on_regex(self, commands, *args, **options):
+        return self.register("regex", commands, *args, **options)
 
-    def on_keyword(self, commands, **options):
-        return self.register("keyword", commands, **options)
+    def on_keyword(self, commands, *args, **options):
+        return self.register("keyword", commands, *args, **options)
 
-    def on_file(self, commands, **options):
-        # This transport carries text input only.
-        raise Unsupported("file input is unavailable")
+    def on_file(self, file_type, *args, **options):
+        return self.register("file", file_type, *args, **options)
+
+    def on_message(self, unique_id=None, *args, **options):
+        return self.register(
+            "message", unique_id or str(uuid.uuid4()), *args, **options
+        )
+
+    def on_meta(self, event_name, block=False, aside=None):
+        return self.register("meta", event_name, block=block, prefix=False, aside=aside)
 
 
 class Plugins:
-    def __new__(cls, name="", **kwargs):
+    def __new__(cls, name="", *args, **kwargs):
+        if name is None:
+            raise ValueError("Plugins.name is None!")
         if _service_store is not None and name in _plugin_settings:
-            check_redeclaration(_plugin_settings[name], kwargs)
+            positional = dict(
+                zip(
+                    (
+                        "pm",
+                        "priority",
+                        "enabled",
+                        "area",
+                        "black_list",
+                        "white_list",
+                        "bot_white_list",
+                        "bot_black_list",
+                    ),
+                    args,
+                )
+            )
+            check_redeclaration(_plugin_settings[name], {**positional, **kwargs})
             return _plugin_settings[name]
         return super().__new__(cls)
 
     def __init__(
         self,
         name="",
-        *,
         pm=6,
         priority=5,
         enabled=True,
         area="SV",
-        prefix=(),
-        force_prefix=(),
-        allow_empty_prefix=None,
-        alias=(),
         black_list=(),
         white_list=(),
-        bot_black_list=(),
         bot_white_list=(),
+        bot_black_list=(),
+        sv=None,
+        prefix=(),
+        force_prefix=(),
+        disable_force_prefix=False,
+        allow_empty_prefix=None,
+        force=False,
+        alias=(),
         **options,
     ):
         if name != _plugin or options:
@@ -289,6 +336,21 @@ class Plugins:
         self.pm = pm
         self.priority = priority
         self.enabled = enabled
+        self.prefix = [prefix] if isinstance(prefix, str) else list(prefix)
+        self.force_prefix = list(force_prefix)
+        self.disable_force_prefix = disable_force_prefix
+        self.alias = list(alias)
+        self.sv = {}
+        self.white_list, self.black_list = list(white_list), list(black_list)
+        self.bot_white_list, self.bot_black_list = (
+            list(bot_white_list),
+            list(bot_black_list),
+        )
+        self.allow_empty_prefix = (
+            not any((*self.prefix, *self.force_prefix))
+            if allow_empty_prefix is None
+            else allow_empty_prefix
+        )
         self._restrictions = {
             "pm": pm,
             "area": area,
@@ -300,9 +362,11 @@ class Plugins:
         self._acl_blocked = bool(
             black_list or white_list or bot_black_list or bot_white_list
         )
-        prefixes = (prefix,) if isinstance(prefix, str) else tuple(prefix)
-        self.prefixes = tuple(dict.fromkeys((*prefixes, *force_prefix)))
-        if allow_empty_prefix or (allow_empty_prefix is None and not self.prefixes):
+        prefixes = [p for p in self.prefix if p]
+        if not disable_force_prefix:
+            prefixes.extend(self.force_prefix)
+        self.prefixes = tuple(dict.fromkeys(prefixes))
+        if self.allow_empty_prefix and "" not in self.prefixes:
             self.prefixes += ("",)
         if _service_store is not None:
             _service_store.restore("plugin", self)
@@ -315,40 +379,114 @@ class Plugins:
         _service_store.update("plugin", self, changes)
 
 
-class Event(SimpleNamespace):
-    pass
-
-
-@dataclass
-class Message:
-    type: str
-    data: object
-
-
 class MessageSegment:
+    def __add__(self, other):
+        return [self, other]
+
     @staticmethod
     def text(content):
         return Message("text", content)
 
     @staticmethod
     def image(img):
-        return Message("image", img)
+        from PIL import Image
+
+        if isinstance(img, Image.Image):
+            data = _encode_image(img.convert("RGB"))
+        elif isinstance(img, str) and img.startswith("http"):
+            return Message("image", "link://" + img)
+        elif isinstance(img, str) and img.startswith(("file://", "base64://")):
+            return Message("image", img)
+        else:
+            data = _media_bytes(img)
+        return Message("image", "base64://" + base64.b64encode(data).decode("ascii"))
 
     @staticmethod
     def node(content_list):
-        return Message("node", content_list)
+        items = []
+        for part in content_list:
+            if isinstance(part, Message):
+                items.append(part)
+            elif isinstance(part, bytes) or (
+                isinstance(part, str)
+                and part.startswith(("http", "base64://", "file://"))
+            ):
+                items.append(MessageSegment.image(part))
+            elif not isinstance(part, (bytearray, memoryview)):
+                items.append(MessageSegment.text(part))
+        return Message("node", items)
 
     @staticmethod
     def file(content, file_name):
-        return Message("file", file_payload(content, file_name))
+        if isinstance(content, str) and content.startswith("http"):
+            return Message("file", f"{file_name}|link://{content}")
+        return Message("file", file_payload(_media_bytes(content), file_name))
+
+    @staticmethod
+    def buttons(buttons=None):
+        import msgspec
+
+        return Message("buttons", msgspec.to_builtins(process_buttons(buttons)))
+
+    @staticmethod
+    def template_buttons(template_id):
+        return Message("template_buttons", template_id)
+
+    @staticmethod
+    def markdown(content, buttons=None):
+        parts = [Message("markdown", content)]
+        if buttons:
+            parts.append(MessageSegment.buttons(buttons))
+        return parts
+
+    @staticmethod
+    def template_markdown(template_id, para, buttons=None):
+        parts = [
+            Message("template_markdown", {"template_id": template_id, "para": para})
+        ]
+        if buttons:
+            parts.append(MessageSegment.buttons(buttons))
+        return parts
+
+    @staticmethod
+    def card(content, card_type="tuwen"):
+        return [Message("card", {"type": card_type, "content": content})]
+
+    @staticmethod
+    def image_size(size):
+        return Message("image_size", size)
+
+    @staticmethod
+    def at(user):
+        return Message("at", user)
+
+    @staticmethod
+    def log(type, content):
+        return Message(f"log_{type}", content)
+
+    @staticmethod
+    def record(content):
+        return Message("record", _media_uri(content))
+
+    @staticmethod
+    def video(content):
+        return Message("video", _media_uri(content))
 
 
-@dataclass
-class Button:
-    text: str
-    data: str
-    action: int = -1
-    prefix: str = ""
+def process_buttons(buttons):
+    if not buttons:
+        return buttons
+
+    def prepare(button):
+        if button.prefix and not button._edited:
+            button.data = button.prefix + button.data
+            button._edited = True
+        return button
+
+    first = buttons[0]
+    if isinstance(first, list) and (not first or isinstance(first[0], Button)):
+        return [[prepare(item) for item in row] for row in buttons]
+    return [prepare(item) for item in buttons]
 
 
 # Log frames belong to the adapter, not to a chat recipient. Keep a bounded,
@@ -420,36 +558,57 @@ def _encode_image(image):
     return stream.getvalue()
 
 
-async def convert_img(img, *, is_base64=False):
-    data = _image_bytes(img)
-    if is_base64:
-        return "base64://" + base64.b64encode(data).decode("ascii")
-    return data
+def _media_bytes(value):
+    if isinstance(value, (str, PathLike)):
+        path = Path(value).resolve()
+        if not any(
+            root and path.is_relative_to(root) for root in (_source, _data_root)
+        ):
+            raise UnsupportedMessage("media path outside plugin directories")
+        with path.open("rb") as stream:
+            value = stream.read(MAX_INPUT_IMAGE_BYTES + 1)
+    if (
+        not isinstance(value, (bytes, bytearray, memoryview))
+        or len(value) > MAX_INPUT_IMAGE_BYTES
+    ):
+        raise UnsupportedMessage("unsupported media payload")
+    return bytes(value)
 
 
-def _help_rows(sections, prefix, pm):
-    for category, section in sections.items():
-        entries = [
-            item for item in section["data"] if pm <= 1 or not item.get("need_admin")
-        ]
-        if not entries:
-            continue
-        yield True, category
-        if section.get("desc"):
-            yield False, section["desc"]
-        for item in entries:
-            yield False, f"{item['name']}   {item['desc']}"
-            if item.get("eg"):
-                yield False, f"  {prefix}{item['eg']}"
+def _media_uri(value):
+    if isinstance(value, str) and value.startswith(("base64://", "file://")):
+        return value
+    return "base64://" + base64.b64encode(_media_bytes(value)).decode("ascii")
+
+
+def convert_img_sync(img, is_base64=False):
+    from PIL import Image
+
+    if not isinstance(img, Image.Image):
+        return "base64://" + base64.b64encode(_media_bytes(img)).decode("ascii")
+    if not 0 < img.width * img.height <= MAX_INPUT_PIXELS:
+        raise UnsupportedMessage("invalid image dimensions")
+    stream = BytesIO()
+    if img.format == "GIF":
+        img.save(stream, format="GIF")
+    else:
+        img.convert("RGB").save(stream, format="JPEG", quality=85)
+    data = _media_bytes(stream.getvalue())
+    return "base64://" + base64.b64encode(data).decode("ascii") if is_base64 else data
+
+
+async def convert_img(img, is_base64=False):
+    return await asyncio.to_thread(convert_img_sync, img, is_base64)
 
 
 def worker_font(source, package_name, size):
     """Load a CJK face available to this isolated renderer."""
     from PIL import ImageFont
 
-    directory = Path(source) / package_name / "utils" / "fonts"
+    repository = Path(source) / package_name
     candidates = [
-        *sorted(directory.glob("*origin.ttf")),
+        *sorted((repository / package_name / "utils" / "fonts").glob("*origin.ttf")),
+        *sorted((repository / "utils" / "fonts").glob("*origin.ttf")),
         "msyh.ttc",
         "NotoSansCJK-Regular.ttc",
     ]
@@ -461,58 +620,26 @@ def worker_font(source, package_name, size):
     raise UnsupportedMessage("no CJK font available")
 
 
-async def get_new_help(
-    *,
-    plugin_name,
-    plugin_info,
-    plugin_help,
-    plugin_prefix,
-    plugin_icon=None,
-    banner_bg=None,
-    banner_sub_text="",
-    pm=6,
-    **style,
-):
-    """Render the upstream help schema with its labels, examples and branding."""
-    from PIL import Image, ImageDraw, ImageOps
-    from textwrap import wrap
-
-    width = 760
-    rows = []
-    for heading, line in _help_rows(plugin_help, plugin_prefix, pm):
-        for part in wrap(str(line), 32, replace_whitespace=False):
-            rows.append((heading, part))
-    height = 140 + len(rows) * 31
-    if width * height > MAX_INPUT_PIXELS:
-        raise UnsupportedMessage("help table exceeds image dimensions")
-    canvas = Image.new("RGB", (width, height), (30, 34, 43))
-    if banner_bg:
-        banner = ImageOps.fit(banner_bg.convert("RGB"), (width, 110))
-        canvas.paste(Image.blend(banner, Image.new("RGB", banner.size), 0.6))
-    if plugin_icon:
-        icon = plugin_icon.convert("RGBA")
-        icon.thumbnail((80, 80))
-        canvas.paste(icon, (15, 14), icon)
-    font = worker_font(_source, _plugin, 20)
-    draw = ImageDraw.Draw(canvas)
-    draw.text((112, 20), "  ".join((plugin_name, *plugin_info.keys())), font=font)
-    draw.text((112, 57), banner_sub_text, font=font)
-    for index, (heading, line) in enumerate(rows):
-        draw.text(
-            (18 if heading else 36, 120 + index * 31),
-            line,
-            font=font,
-            fill=(135, 223, 255) if heading else (242, 243, 245),
-        )
-    return _encode_image(canvas)
-
-
 class Bot:
-    def __init__(self, *, target_transport=None, interaction=None):
+    get_lang = bot_get_lang
+    t = bot_t
+
+    def __init__(self, bot=None, ev=None, *, target_transport=None, interaction=None):
+        self._lang = None
+        self.ev = ev if ev is not None else Event()
+        self.bot = bot
+        self.bot_id = self.ev.bot_id
+        self.bot_self_id = self.ev.bot_self_id
+        self.uid = self.ev.user_id or "0"
+        self.bid = self.bot_id or "0"
+        self.temp_gid = (
+            self.uid if self.ev.user_type == "direct" else self.ev.group_id or "0"
+        )
+        self.session_id = f"{self.bid}%%%{self.temp_gid}%%%{self.uid}"
         self._target_transport = target_transport
         self._interaction = interaction
         self.messages = []
-        self.logger = _BotLog()
+        self.logger = bot.logger if bot is not None else _BotLog()
         self.image_size = 0
         self.text_size = 0
 
@@ -647,7 +774,8 @@ class Bot:
             self._append("\n".join(choices))
 
 
-def get_res_path(name=None):
+def get_res_path(_path=None):
+    name = _path
     root = _data_root / "resources"
     if isinstance(name, Path):
         root = name if name.is_absolute() else root / name
@@ -668,25 +796,21 @@ def get_res_path(name=None):
     return root
 
 
+def plugin_settings(name):
+    if name not in _plugin_settings:
+        raise ValueError(f"插件{name}不存在!")
+    return _plugin_settings[name]
+
+
 def get_plugin_available_prefix(name):
-    if name != _plugin:
-        raise KeyError(name)
-    return _prefix
-
-
-def to_thread(function):
-    import asyncio
-    import inspect
-
-    @wraps(function)
-    async def run(*args, **kwargs):
-        if inspect.iscoroutinefunction(function):
-            return await asyncio.to_thread(
-                lambda: asyncio.run(function(*args, **kwargs))
-            )
-        return await asyncio.to_thread(function, *args, **kwargs)
-
-    return run
+    if _service_store is None and name == _plugin and name not in _plugin_settings:
+        return _prefix
+    plugin = plugin_settings(name)
+    if not plugin.disable_force_prefix and plugin.force_prefix:
+        return plugin.force_prefix[0]
+    if plugin.disable_force_prefix and plugin.prefix:
+        return plugin.prefix[0]
+    return ""
 
 
 def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
@@ -708,92 +832,119 @@ def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
         if source_root
         else (Path.cwd() / "source").resolve()
     )
-    package("gsuid_core")
+    core = package("gsuid_core")
+    package("gsuid_core.version").__version__ = core.__version__ = "0.12.2"
+    install_app_life(package)
+    triggers = package("gsuid_core.trigger")
+    for name in (
+        "Trigger",
+        "dispatch_sort_key",
+        "registry_version",
+        "bump_registry_version",
+        "gap_chars",
+    ):
+        setattr(triggers, name, getattr(plugin_trigger, name))
     sv = package("gsuid_core.sv")
-    sv.SL = SimpleNamespace(plugins=_plugin_settings, lst=_services)
+    sv.SVList = SVList
+    sv.SL = SVList()
+    sv.SL.plugins = _plugin_settings
+    sv.SL.lst = _services
     sv.SV = SV
     sv.Plugins = Plugins
     sv.get_plugin_available_prefix = get_plugin_available_prefix
+    sv.get_plugin_prefixs = lambda name: plugin_settings(name).prefix
+    sv.get_plugin_prefix = lambda name: sv.get_plugin_prefixs(name)[0]
+    sv.get_plugin_force_prefixs = lambda name: plugin_settings(name).force_prefix
+    sv.get_plugin_force_prefix = lambda name: sv.get_plugin_force_prefixs(name)[0]
     messages = package("gsuid_core.message_models")
     messages.Button = Button
+    messages.ButtonType = ButtonType
+    messages.ButtonList = ButtonList
     messages.Message = Message
-    package("gsuid_core.bot").Bot = Bot
+    from msgspec import json as msgjson
+
+    bot = package("gsuid_core.bot")
+    bot.Bot = Bot
+    bot.msgjson = msgjson
     models = package("gsuid_core.models")
     models.Event = Event
     models.Message = Message
-    package("gsuid_core.segment").MessageSegment = MessageSegment
-    package("gsuid_core.logger").logger = logging.getLogger("sayu")
-    package("gsuid_core.data_store").get_res_path = get_res_path
-    package("gsuid_core.i18n").t = (
-        lambda key, **fields: key.format_map(fields) if fields else key
-    )
+    models.MessageReceive = MessageReceive
+    models.MessageSend = MessageSend
+    segments = package("gsuid_core.segment")
+    segments.MessageSegment = MessageSegment
+    segments.process_buttons = process_buttons
+    core_config = install_core_config(package("gsuid_core.config"), _data_root)
+    install_ai(package)
+    install_logger(package("gsuid_core.logger"), core_config, source_root=_source)
+    install_data_store(package("gsuid_core.data_store"), get_res_path)
+    install_i18n(package("gsuid_core.i18n"), source_root=_source)
     package("gsuid_core.utils")
-    pool = package("gsuid_core.pool")
-    pool.to_thread = pool.run_in_thread_pool = to_thread
-    package("gsuid_core.utils.plugins_config")
-    config = package("gsuid_core.utils.plugins_config.models")
-    for name, model in MODELS.items():
-        setattr(config, name, model)
-    package(
-        "gsuid_core.utils.plugins_config.gs_config"
-    ).StringConfig = configuration_type(_data_root)
+    install_qrlogin(package, _data_root)
+    install_status(package)
+    downloads = install_downloads(package, _data_root)
+    install_minigg(package, _data_root)
+    install_public_api()
+    install_pool(package)
+    install_settings(package, _data_root, plugin)
     package("gsuid_core.utils.image")
-    package("gsuid_core.utils.image.convert").convert_img = convert_img
-    package("gsuid_core.help")
-    package("gsuid_core.help.model").PluginHelp = dict
-    package("gsuid_core.help.draw_new_plugin_help").get_new_help = get_new_help
+    published = PublishedImages(_source, plugin)
+    install_image_fetch(package, _data_root, published=published)
+    tools = install_image_tools(package, _source, _data_root, fetch=published.fetch)
+    tools.get_div = plugin_text_image.get_div
+    tools.draw_center_text_by_line = plugin_text_image.draw_center_text_by_line
+    package(
+        "gsuid_core.utils.image.mys",
+        Path(__file__).parent / "plugin_public_ports" / "bbs",
+    )
+    conversion = package("gsuid_core.utils.image.convert")
+    conversion.convert_img = convert_img
+    conversion.convert_img_sync = convert_img_sync
+    for name in (
+        "str_lenth",
+        "get_str_size",
+        "get_height",
+        "text2pic",
+        "number_to_chinese",
+    ):
+        setattr(conversion, name, getattr(plugin_text_image, name))
+    install_help(package, _data_root, source_root=_source)
+    return downloads
 
 
-def _match(route, raw, kind):
-    service = route.service
+def _authorized(subject, event, mapped):
+    if not subject.enabled or event.user_pm > subject.pm:
+        return False
+    restrictions = subject._restrictions
+    if subject._acl_blocked and not mapped:
+        return False
+    actor, room = event.user_id, event.group_id
+    denied = restrictions["black_list"]
+    allowed = restrictions["white_list"]
+    if actor in denied or room in denied:
+        return False
+    if allowed and allowed != ("",) and actor not in allowed and room not in allowed:
+        return False
+    bots = {b for b in restrictions.get("bot_white_list", ()) if b}
+    excluded = {b for b in restrictions.get("bot_black_list", ()) if b}
+    return event.bot_self_id not in excluded and (not bots or event.bot_self_id in bots)
+
+
+def _match(route, event, mapped):
+    kind = event.user_type.upper()
     settings = _plugin_settings.get(_plugin)
     if settings and (
-        not settings.enabled
-        or settings.pm < 6
-        or settings._acl_blocked
-        or settings.area not in ("SV", "ALL", kind.upper())
+        not _authorized(settings, event, mapped)
+        or settings.area not in ("SV", "ALL", kind)
     ):
         return None
-    if (
-        not service.enabled
-        or service._acl_blocked
-        or service.pm < 6
-        or service.area not in ("ALL", kind.upper())
-    ):
+    if not _authorized(route.sv, event, mapped):
         return None
-    text = raw.strip(_GAPS)
-    if not text.startswith(route.prefix):
+    if route.sv.area not in ("ALL", kind) and not (settings and settings.area == "ALL"):
         return None
-    body = text[len(route.prefix) :].lstrip(_GAPS)
-
-    pattern = route.pattern
-    if route.mode == "fullmatch":
-        match = pattern.fullmatch(body)
-    elif route.mode == "keyword":
-        match = pattern.search(text)
-    elif route.mode in ("suffix", "regex"):
-        match = pattern.search(body)
-    else:
-        match = pattern.match(body)
-    if match is None:
-        return None
-    if route.mode == "regex":
-        groups = match.groups()
-        return dict(
-            command="|".join(v or "" for v in groups),
-            text="|".join(v or "" for v in pattern.split(raw)),
-            regex_dict=match.groupdict(),
-            regex_group=groups,
-        )
-    if route.mode in ("suffix", "keyword"):
-        head = re.match(_literal_pattern(route.keyword), body)
-        remainder = body[head.end() :] if head else body.replace(route.keyword, "", 1)
-    else:
-        remainder = body[match.end() :]
-    remainder = remainder.strip(_GAPS)
-    if route.mode in ("prefix", "suffix") and not remainder:
-        return None
-    return dict(text=remainder, command=route.keyword, regex_group=(), regex_dict={})
+    if (event.meta_event_type is not None) != (route.type == "meta"):
+        return False
+    return route.check_command(event)
 
 
 async def dispatch(
@@ -808,50 +959,55 @@ async def dispatch(
 ):
     if conversation_kind == "group" and not group_id:
         group_id = conversation_id
-    ordered = sorted(
-        _routes,
-        key=lambda r: (
-            not r.prefix,
-            r.service.priority,
-            _ranks[r.mode],
-            -len(r.keyword)
-            if r.mode in {"fullmatch", "command", "prefix", "suffix"}
-            else 0,
-        ),
-    )
-    bot = Bot()
-    invoked = False
-    for route in ordered:
-        kind = "group" if group_id else conversation_kind
-        fields = _match(route, text, kind)
-        if fields is None:
-            continue
-        event = Event(
-            **fields,
+    return await dispatch_event(
+        Event(
+            text=text,
             raw_text=text,
+            content=[Message("text", text)],
             user_id=actor_id,
             group_id=group_id,
-            user_type=kind,
-            user_pm=6,
+            user_type="group" if group_id else conversation_kind,
             msg_id=message_id,
             bot_id=adapter_id,
             real_bot_id=adapter_id,
-            bot_self_id="",
             WS_BOT_ID="",
-            at=None,
-            sender={},
-            image=None,
-            reply=None,
-            file=None,
-            file_type=None,
-            file_name=None,
-        )
-        await route.handler(bot, event)
-        invoked = True
-        if route.block:
+        ),
+        mapped=False,
+    )
+
+
+async def dispatch_event(incoming, *, mapped):
+    """Dispatch a decoded adapter event. Only trusted adapter inputs can supply roles."""
+    matched = [route for route in _routes if _match(route, incoming, mapped)]
+    listeners = [route for route in matched if route.type == "message"]
+    commands = sorted(
+        (route for route in matched if route.type != "message"),
+        key=lambda r: plugin_trigger.dispatch_sort_key(r, r.sv.priority),
+    )
+    parts = []
+    bytes_used = text_used = 0
+    first_error = None
+    for route in (*listeners, *commands):
+        event = await route.get_command(deepcopy(incoming))
+        event.task_id = str(uuid.uuid4())
+        bot = Bot(ev=event)
+        bot.messages = parts
+        bot.text_size, bot.image_size = text_used, bytes_used
+        try:
+            await route.func(bot, event)
+        except (UnsupportedMessage, Unsupported, ImportError, NotImplementedError):
+            raise
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            _BotLog.emit("ERROR", type(exc).__name__)
+        text_used, bytes_used = bot.text_size, bot.image_size
+        if route.block and route.type != "message":
             break
-    if not invoked:
-        raise NoMatch
-    if not bot.messages:
+    if not parts:
+        if first_error is not None:
+            raise first_error
+        if not commands:
+            raise NoMatch
         raise UnsupportedMessage("handler produced no deliverable content")
-    return bot.messages
+    return parts

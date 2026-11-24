@@ -37,7 +37,11 @@ async def probe(mode, phase, work):
         for declaration in server.load_plugin(work / "gsuid_core/plugins" / NAME):
             server.cached_import(*declaration)
     else:
-        sys.path.insert(0, str(ROOT / "worker"))
+        from build_local import worker_archive
+
+        worker = work / "worker.pyz"
+        worker.write_bytes(worker_archive({"package": NAME, "prefix": "sp"}))
+        sys.path.insert(0, str(worker))
         import sayu_compat as loader
         from service_settings import management_scope
         from functools import partial
@@ -91,7 +95,40 @@ async def probe(mode, phase, work):
                     allowed.append(False)
                 else:
                     allowed.append(True)
+        from gsuid_core.models import Event
+
+        identity_matrix = []
+        for pm, user, group, area, addressed in [
+            (2, "actor", "room", "group", True),
+            (6, "actor", "room", "group", True),
+            (0, "excluded", "room", "group", True),
+            (0, "actor", "elsewhere", "group", True),
+            (0, "actor", "room", "direct", True),
+            (0, "actor", "room", "group", False),
+        ]:
+            ev = Event(
+                raw_text="spact",
+                user_pm=pm,
+                user_id=user,
+                group_id=group,
+                user_type=area,
+                is_tome=addressed,
+            )
+            if mode == "native":
+                accepted = _sv_authorized(plugin.moderated, ev, pm) and any(
+                    trigger.check_command(ev)
+                    for trigger in plugin.moderated.TL["fullmatch"].values()
+                )
+            else:
+                try:
+                    reply = await loader.dispatch_event(ev, mapped=True)
+                except loader.NoMatch:
+                    accepted = False
+                else:
+                    accepted = reply == [{"text": "granted"}]
+            identity_matrix.append(accepted)
         return {
+            "identity_matrix": identity_matrix,
             "registered": registered,
             "allowed": allowed,
             "priority": plugin.query.priority,
@@ -181,6 +218,11 @@ def main():
         ]
         assert [row["priority"] for row in stages] == [5, 2, 2, 2, 3]
         assert stages[2] == stages[3]
+        assert all(
+            row["identity_matrix"]
+            == [row["plugin_enabled"], False, False, False, False, False]
+            for row in stages
+        )
     args.output.write_text(json.dumps(report, indent=2), encoding="utf8")
 
 

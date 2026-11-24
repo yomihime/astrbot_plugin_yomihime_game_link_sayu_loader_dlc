@@ -1,6 +1,7 @@
 """Owner-scoped UID bindings in the profile's private SQLite database."""
 
 from contextlib import closing, contextmanager
+import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ class Owner:
     adapter: str
     writable: bool
     active: bool = True
+    task: asyncio.Task | None = None
 
 
 _current = ContextVar("binding_owner", default=None)
@@ -24,6 +26,10 @@ _COLUMNS = ("uid", "sr_uid", "bb_uid", "bbb_uid", "zzz_uid", "wd_uid")
 @contextmanager
 def binding_scope(actor, adapter, private, *, writable=False):
     owner = Owner(actor, adapter, writable, bool(private and actor and adapter))
+    try:
+        owner.task = asyncio.current_task()
+    except RuntimeError:
+        pass  # Synchronous entry has no owning event-loop task.
     token = _current.set(owner)
     try:
         yield

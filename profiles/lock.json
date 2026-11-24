@@ -6,8 +6,8 @@
     "version": "0.2.0",
     "package": "StarRailUID",
     "prefix": "sr",
-    "runtime_mode": "declarations",
-    "snapshot_sha256": "ca7c50e9ab63418ef78669a5ddf7fe7b7e5f0d9cdc98d00c68c54425946a3b32"
+    "runtime_mode": "package",
+    "snapshot_sha256": "3bc706aa7eab83f83954e43bda7ebd5e5bcc725c40083d090567df8109e0ac5b"
   },
   "genshin": {
     "directory": "upstream",
@@ -16,8 +16,8 @@
     "version": "6.4.0",
     "package": "GenshinUID",
     "prefix": "gs",
-    "runtime_mode": "declarations",
-    "snapshot_sha256": "68779e970316013900a375ebba9a13f3b0ccfc2d62e1aeffd6e49381f1ba488a"
+    "runtime_mode": "package",
+    "snapshot_sha256": "dbaeba58de5d486864ccfb3097d4e126714a9f5604edcdef7e5c92af59ccda0f"
   },
   "waves": {
     "directory": "upstream",
@@ -26,7 +26,7 @@
     "version": "3.8.1",
     "package": "XutheringWavesUID",
     "prefix": "ww",
-    "runtime_mode": "declarations",
-    "snapshot_sha256": "b8c0826bf2af3b767b905a5d2dbe0cecace959b1715b4e1b0b217f644d1f2538"
+    "runtime_mode": "package",
+    "snapshot_sha256": "42a5c78d063e412815204e0d28461429b206e60df10c716000f708ebb09074b2"
   }
 }

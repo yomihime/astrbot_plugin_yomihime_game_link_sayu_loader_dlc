@@ -5,42 +5,32 @@ import errno
 import json
 import os
 import sys
-from collections import Counter
 from pathlib import Path
 
 import sayu_compat
-from declarations import Unsupported
-from discovery import Discovery, discover
-from game_profile import PACKAGE, PREFIX, RUNTIME_MODE
+from port_errors import Unsupported
+from game_profile import OFFLINE, PACKAGE, PREFIX, RUNTIME_MODE
 from images import prepare_owner_parts, prepare_public_parts
 from plugin_runtime import PluginRuntime
 from plugin_bindings import binding_scope
 from service_settings import management_scope
+from worker_storage import install_write_guard
 
 
 class Worker:
     def __init__(self, source, data):
         self.source = source
         self.data = data
-        self.skipped = Counter()
-        self.plugin = None
-        self.discovery = None
+        self.plugin = PluginRuntime(self.data)
 
     async def start(self):
-        sayu_compat.install(PACKAGE, PREFIX, self.data, source_root=self.source)
-        if RUNTIME_MODE == "package":
-            self.plugin = PluginRuntime(self.data)
-            with management_scope(writable=True):
-                await self.plugin.start(self.source, PACKAGE)
-        elif RUNTIME_MODE == "declarations":
-            # Declaration-only profiles do not execute the package directory initializer.
-            sayu_compat.get_res_path(PACKAGE)
-            self.discovery = Discovery(self.source, PACKAGE)
-            await discover(
-                self.source, PACKAGE, skipped=self.skipped, discovery=self.discovery
-            )
-        else:
-            raise ValueError("unknown worker runtime mode")
+        self.downloads = sayu_compat.install(
+            PACKAGE, PREFIX, self.data, source_root=self.source
+        )
+        if RUNTIME_MODE != "package":
+            raise ValueError("package initialization is required")
+        with management_scope(writable=True):
+            await self.plugin.start(self.source, PACKAGE)
 
     async def handle(self, request):
         if request.get("op") == "inventory":
@@ -48,16 +38,17 @@ class Worker:
                 "mode": RUNTIME_MODE,
                 "adapter_log_counts": sayu_compat.adapter_log_counts(),
                 "registered": sayu_compat.registration_counts(),
-                "skipped": dict(self.skipped),
-                "failed_jobs": sorted(self.plugin.failed_jobs) if self.plugin else [],
+                "modules": self.plugin.modules,
+                "failed_jobs": sorted(self.plugin.failed_jobs),
+                "failed_hook_phases": dict(self.plugin.hook_errors),
+                "database_migrations": dict(self.plugin.orm.report),
+                "downloads": self.downloads.mirror.diagnostics(),
             }
             if request.get("list_triggers"):
                 report["triggers"] = sayu_compat.registered_triggers()
             return report
         if request.get("op") is not None:
             raise ValueError("unknown operation")
-        if self.discovery is not None:
-            self.discovery.assets.begin_invocation()
         event = request["event"]
         with (
             management_scope(),
@@ -92,6 +83,10 @@ def error_code(exc):
 
 
 async def serve(output):
+    if OFFLINE:
+        from worker_storage import install_offline_guard
+
+        install_offline_guard()
     worker = Worker(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())
     try:
         await worker.start()
@@ -101,7 +96,16 @@ async def serve(output):
             {"error": error_code(exc), "phase": "startup", "type": type(exc).__name__},
         )
         return
-    send(output, {"ready": True, "mode": RUNTIME_MODE})
+    send(
+        output,
+        {
+            "ready": True,
+            "mode": RUNTIME_MODE,
+            "failed_modules": sum(
+                error is not None for error in worker.plugin.modules.values()
+            ),
+        },
+    )
     try:
         while True:
             line = await asyncio.to_thread(sys.stdin.buffer.readline, 16385)
@@ -164,6 +168,7 @@ def main():
             )
             return
         with lock:
+            install_write_guard(Path(sys.argv[1]).resolve().parent, sys.argv[2])
             asyncio.run(serve(output))
 
 

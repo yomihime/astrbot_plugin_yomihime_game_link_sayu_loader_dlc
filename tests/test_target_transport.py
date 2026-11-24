@@ -29,9 +29,13 @@ class TargetTransportTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(UnsupportedMessage):
             await bot.target_send("test", "direct", "other")
         emit.assert_not_awaited()
-        for content in (Path("local.txt"), "https://example.invalid/resource"):
-            with self.assertRaises(UnsupportedMessage):
-                MessageSegment.file(content, "fixture.bin")
+        with self.assertRaises(UnsupportedMessage):
+            MessageSegment.file(Path("local.txt"), "fixture.bin")
+        link = MessageSegment.file("https://example.invalid/resource", "fixture.bin")
+        self.assertEqual(link.data, "fixture.bin|link://https://example.invalid/resource")
+        with self.assertRaises(UnsupportedMessage):
+            await bot.target_send(link, "direct", "recipient")
+        emit.assert_not_awaited()
 
     async def test_transport_failures_propagate(self):
         emit = AsyncMock(side_effect=OSError("offline"))

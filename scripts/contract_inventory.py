@@ -4,7 +4,7 @@ import argparse
 import ast
 import hashlib
 import json
-import subprocess
+import zipfile
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -42,27 +42,29 @@ def consumers():
     result = defaultdict(set)
     locks = json.loads((ROOT / "profiles/lock.json").read_bytes())
     for key, lock in locks.items():
-        repo = ROOT / ".sayu-local" / key / lock["directory"]
-
-        def git(*args):
-            return subprocess.check_output(["git", "-C", str(repo), *args])
-
-        if git("rev-parse", "HEAD").decode().strip() != lock["commit"]:
-            raise ValueError(f"{key} differs from pinned revision")
-        git("diff", "--quiet", "HEAD", "--", "*.py")
-        for name in git("ls-files", "-z", "*.py").decode().split("\0"):
-            if not name:
-                continue
-            for node in ast.walk(parse(repo / name)):
-                if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                    "gsuid_core"
-                ):
-                    for item in node.names:
-                        result[f"{node.module}.{item.name}"].add(key)
-                if isinstance(node, ast.Import):
-                    for item in node.names:
-                        if item.name.startswith("gsuid_core"):
-                            result[item.name].add(key)
+        digest = lock["snapshot_sha256"]
+        archive = ROOT / ".sayu-local" / "runtime" / f"{lock['package']}-{digest}.zip"
+        with archive.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                raise ValueError(f"{key} differs from its pinned archive")
+            stream.seek(0)
+            with zipfile.ZipFile(stream) as zipped:
+                for name in zipped.namelist():
+                    if not name.endswith(".py"):
+                        continue
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", SyntaxWarning)
+                        tree = ast.parse(zipped.read(name), filename=name)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.ImportFrom) and (
+                            node.module or ""
+                        ).startswith("gsuid_core"):
+                            for item in node.names:
+                                result[f"{node.module}.{item.name}"].add(key)
+                        if isinstance(node, ast.Import):
+                            for item in node.names:
+                                if item.name.startswith("gsuid_core"):
+                                    result[item.name].add(key)
     return result
 
 
@@ -93,6 +95,103 @@ def proof_index():
     # An entry names the probe that exercises part of a symbol's surface.
     # It never promotes untested arguments or inherited APIs to verified status.
     probes = {
+        "trigger_contract": [
+            "trigger.Trigger.check_command",
+            "trigger.Trigger.get_command",
+            "trigger.Trigger.gap_positions",
+            "trigger.dispatch_sort_key",
+        ],
+        "layout_contract": [
+            "server.GsServer.load_dir_plugins",
+            "server.read_meta_plugin_info",
+            "meta_plugins.require",
+            "meta_plugins.provides_of",
+            "meta_plugins.import_api",
+            "meta_plugins.bind_meta_plugin_facade",
+            "meta_plugins.unregister_meta_plugin",
+            "meta_plugins.list_meta_plugins",
+        ],
+        "message_contract": [
+            "models.Event",
+            "models.Message",
+            "models.MessageSend",
+            "models.MessageReceive",
+            "message_models.Button",
+            "models.Event.get_meta",
+            "models.Event.session_id",
+            "segment.MessageSegment",
+            "segment.process_buttons",
+        ],
+        "orm_contract": [
+            "utils.database.base_models.Bind",
+            "utils.database.base_models.BaseModel",
+            "utils.database.base_models.User",
+            "utils.database.base_models.with_session",
+            "utils.database.startup.exec_list",
+        ],
+        "image_tools_contract": [
+            "utils.image.image_tools." + name
+            for name in (
+                "crop_center_img",
+                "easy_alpha_composite",
+                "draw_text_by_line",
+                "CustomizeImage",
+                "draw_pic_with_ring",
+                "get_color_bg",
+                "get_event_avatar",
+                "get_avatar_with_ring",
+                "get_pic",
+            )
+        ],
+        "mys_account_contract": [
+            "utils.api.mys.base_request.BaseMysApi.endpoint_request",
+            "utils.api.mys.base_request.BaseMysApi.get_server_id",
+            "utils.api.mys.api.ApiEndpoint.get",
+        ],
+        "mys_cache_contract": ["utils.cache.gs_cache"],
+        "mys_models_contract": ["utils.api.mys.models"],
+        "subscribe_contract": ["subscribe.GsCoreSubscribe"],
+        "help_contract": [
+            "help.model.PluginHelp",
+            "help.draw_new_plugin_help.get_new_help",
+            "help.draw_plugin_help.get_help",
+            "utils.error_reply.draw_error_img",
+            "utils.error_reply.get_error_type",
+            "utils.image.convert.get_str_size",
+            "utils.image.convert.text2pic",
+            "utils.image.mys.bbs.soup_to_img",
+        ],
+        "scheduler_contract": [
+            "aps.get_all_aps_job",
+            "aps.remove_repeat_job",
+            "aps.add_scheduled_job",
+            "aps.start_scheduler",
+            "aps.shutdown_scheduler",
+        ],
+        "ai_contract": ["ai_core"],
+        "app_life_contract": [
+            "app_life",
+            "utils.cookie_manager.qrlogin.get_qrcode_base64",
+        ],
+        "sign_contract": ["utils.sign.sign.sign_in"],
+        "mys_bbs_contract": ["utils.api.mys.request.MysApi.get_bbs_post_detail"],
+        "pool_contract": [
+            "pool.to_thread",
+            "pool.run_in_thread_pool",
+            "pool.shutdown_pools",
+        ],
+        "inbound_adapter_contract": [
+            "handler.handle_event",
+            "handler.decode_inbound_frame",
+        ],
+        "user_language_contract": [
+            "bot.Bot.get_lang",
+            "bot.Bot.t",
+            "utils.database.models.CoreUser.get_user_lang",
+            "utils.database.models.CoreUser.set_user_lang",
+        ],
+        "minigg_contract": ["utils.api.minigg.request.minigg_request"],
+        "core_config_log_contract": ["config.core_config", "logger.logger"],
         "native_contract": [
             "server.GsServer.load_plugin",
             "server.GsServer.cached_import",

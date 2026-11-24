@@ -19,20 +19,60 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(folder.name)
         host.install("Example", "ex", self.root, runtime_mode="package")
 
+    async def test_passive_listener_has_separate_event_and_cannot_block_command(self):
+        service = host.SV("listening")
+        tasks = []
+
+        @service.on_message("observer", block=True)
+        async def observe(bot, event):
+            tasks.append(event.task_id)
+            event.sender["edited"] = True
+            await bot.send("observer")
+
+        @service.on_command("ping", block=True)
+        async def reply(bot, event):
+            self.assertIs(event, bot.ev)
+            self.assertNotIn("edited", event.sender)
+            tasks.append(event.task_id)
+            await bot.send("command")
+
+        self.assertEqual(
+            await host.dispatch("exping"), [{"text": "observer"}, {"text": "command"}]
+        )
+        self.assertTrue(all(tasks))
+        self.assertEqual(len(set(tasks)), 2)
+
     async def test_unsupported_decorators_and_options_leave_no_route(self):
         service = host.SV("limited")
 
         async def handler(bot, event):
             self.fail("unsupported registration executed")
 
-        for kwargs in ({"to_me": True}, {"to_ai": "tool"}, {"unknown": False}):
-            with self.subTest(kwargs=kwargs), self.assertRaises(Unsupported):
-                service.on_fullmatch("run", **kwargs)(handler)
         with self.assertRaises(Unsupported):
-            service.on_file("file")(handler)
+            service.on_fullmatch("run", unknown=False)(handler)
         self.assertEqual(host.registered_triggers(), [])
         with self.assertRaises(Unsupported):
             host.SV("limited", unknown=True)
+
+    async def test_structured_triggers_require_compatible_event(self):
+        service = host.SV("inputs")
+
+        async def echo(bot, event):
+            await bot.send(event.command)
+
+        service.on_fullmatch("run", to_me=True, to_ai="tool")(echo)
+        service.on_file("json")(echo)
+        service.on_meta("poke")(echo)
+        with self.assertRaises(host.NoMatch):
+            await host.dispatch("exrun")
+        for expected, event in (
+            ("run", host.Event(raw_text="exrun", is_tome=True)),
+            ("json", host.Event(file="base64://e30=", file_name="data.json")),
+            ("poke", host.Event(meta_event_type="poke")),
+        ):
+            self.assertEqual(
+                await host.dispatch_event(event, mapped=True), [{"text": expected}]
+            )
 
     async def test_enabling_cannot_grant_permission(self):
         plugin = host.Plugins("Example", pm=1, force_prefix=["ex"])

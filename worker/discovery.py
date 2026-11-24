@@ -34,10 +34,14 @@ from declarations import (
 )
 from dependency_data import dependency_import
 from public_resources import PublicResources
+from plugin_minigg import FUNCTIONS, REQUEST_EXPORTS
 from source_assets import Assets, AssetPath
 
 
 PORTS = {
+    "gsuid_core.utils.api.minigg.request": set(REQUEST_EXPORTS),
+    "gsuid_core.utils.api.minigg": set(FUNCTIONS),
+    "gsuid_core.utils.image.image_tools": {"crop_center_img"},
     "gsuid_core.sv": {"SV", "get_plugin_available_prefix"},
     "gsuid_core.pool": {"to_thread"},
     "gsuid_core.utils.plugins_config.gs_config": {"StringConfig"},
@@ -237,16 +241,6 @@ class Discovery:
             }[name]
         if (module, name) == ("textwrap", None):
             return SimpleNamespace(fill=textwrap.fill)
-        if (module, name) == ("gsuid_core.utils.image.image_tools", "crop_center_img"):
-            from PIL import ImageOps
-            from sayu_compat import MAX_INPUT_PIXELS
-
-            def crop_center_img(image, width, height):
-                if min(width, height) < 1 or width * height > MAX_INPUT_PIXELS:
-                    raise ValueError("crop outside supported dimensions")
-                return ImageOps.fit(image, (width, height))
-
-            return crop_center_img
         if (module, name) == ("aiofiles", None):
             return SimpleNamespace(open=self.assets.open_async)
         if (module, name) == ("json", None):

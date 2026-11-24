@@ -73,7 +73,8 @@ class SnapshotTest(unittest.TestCase):
             }
             for name, data in sources.items():
                 (repo / name).write_bytes(data)
-            (repo / "README.md").write_text("repo docs", encoding="utf-8")
+            sources["README.md"] = b"repo docs"
+            (repo / "README.md").write_bytes(sources["README.md"])
             git("add", ".")
             git(
                 "-c",
@@ -96,7 +97,8 @@ class SnapshotTest(unittest.TestCase):
             write_snapshot(repo, spec, archive)
             with zipfile.ZipFile(archive) as bundle:
                 self.assertEqual(
-                    {n: bundle.read(n) for n in bundle.namelist()}, sources
+                    {n: bundle.read(n) for n in bundle.namelist()},
+                    {f"Game/{name}": data for name, data in sources.items()},
                 )
             spec["snapshot_sha256"] = file_digest(archive)
             git("config", "core.autocrlf", "true")

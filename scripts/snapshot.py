@@ -45,7 +45,7 @@ def fetch(repository, spec):
         subprocess.run(
             git(repository, "fetch", "--no-tags", "--depth=1", url, commit), check=True
         )
-    # Complete only the package trees if this is an existing partial clone.
+    # Plugins can load resources and configuration relative to the repository root.
     objects = subprocess.check_output(
         git(
             repository,
@@ -54,15 +54,11 @@ def fetch(repository, spec):
             "--missing=print",
             "--no-walk",
             commit,
-            "--",
-            spec["package"],
-            "LICENSE",
-            "ICON.png",
         )
     )
     missing = [row[1:] for row in objects.splitlines() if row.startswith(b"?")]
     if missing:
-        subprocess.run(
+        fetched = subprocess.run(
             git(
                 repository,
                 "fetch",
@@ -72,8 +68,24 @@ def fetch(repository, spec):
                 url,
             ),
             input=b"\n".join(missing) + b"\n",
-            check=True,
         )
+        if fetched.returncode:
+            # Some remotes allow fetching a published commit but not individual
+            # unadvertised blob IDs. Hydrate its full tree without changing refs.
+            subprocess.run(
+                git(
+                    repository,
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--refetch",
+                    "--no-filter",
+                    "--depth=1",
+                    url,
+                    commit,
+                ),
+                check=True,
+            )
 
 
 def zip_entry(name):
@@ -105,10 +117,6 @@ def write_snapshot(repository, spec, output):
             "-r",
             "-z",
             spec["commit"],
-            "--",
-            package,
-            "LICENSE",
-            "ICON.png",
         )
     )
     names = set()
@@ -131,9 +139,7 @@ def write_snapshot(repository, spec, output):
                 name = raw_name.decode("utf-8")
                 if kind != b"blob" or mode not in (b"100644", b"100755"):
                     raise ValueError(f"Unsupported Git object: {name!r}")
-                if not safe_name(name) or not (
-                    name.startswith(package + "/") or name in ("LICENSE", "ICON.png")
-                ):
+                if not safe_name(package) or "/" in package or not safe_name(name):
                     raise ValueError(f"Unsafe snapshot entry: {name!r}")
                 if name.casefold() in names:
                     raise ValueError(f"Duplicate snapshot entry: {name!r}")
@@ -147,13 +153,13 @@ def write_snapshot(repository, spec, output):
                 raw = process.stdout.read(size)
                 if len(raw) != size or process.stdout.read(1) != b"\n":
                     raise RuntimeError(f"Incomplete Git blob for {name!r}")
-                dest.writestr(zip_entry(name), raw)
+                dest.writestr(zip_entry(f"{package}/{name}"), raw)
         finally:
             process.stdin.close()
         if process.wait():
             raise RuntimeError(f"Failed to read pinned Git objects for {package}")
-    if not {"license", (package + "/__init__.py").casefold()} <= names:
-        raise ValueError(f"Missing package files for {package}")
+    if not names:
+        raise ValueError(f"Empty plugin tree for {package}")
 
 
 def pinned_snapshot(directory, spec, runtime):

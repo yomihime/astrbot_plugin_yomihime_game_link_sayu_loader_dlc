@@ -1,0 +1,29 @@
+{
+  "GenshinUID": {
+    "image_origins": [
+      "https://act-webstatic.mihoyo.com",
+      "https://enka.network",
+      "https://fastcdn.mihoyo.com",
+      "https://gi.yatta.top",
+      "https://img-static.mihoyo.com",
+      "https://upload-bbs.mihoyo.com",
+      "https://uploadstatic.mihoyo.com"
+    ],
+    "bulk_mirrors": []
+  },
+  "StarRailUID": {
+    "image_origins": [],
+    "bulk_mirrors": []
+  },
+  "XutheringWavesUID": {
+    "image_origins": [
+      "https://prod-alicdn-community.kurobbs.com",
+      "https://web-static.kurobbs.com"
+    ],
+    "bulk_mirrors": [
+      "https://ww1.loping151.top",
+      "https://ww2.loping151.top",
+      "https://ww3.loping151.cn"
+    ]
+  }
+}

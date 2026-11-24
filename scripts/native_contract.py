@@ -100,6 +100,7 @@ def validate(receipt, *, has_native_master):
         [
             "import",
             "start",
+            "start-error",
             "inspect",
             "first",
             "second",
@@ -111,7 +112,7 @@ def validate(receipt, *, has_native_master):
             *(["admin"] if has_native_master else []),
             "shutdown",
         ],
-        ["import", "start", "state", "shutdown"],
+        ["import", "start", "start-error", "state", "shutdown"],
     ]
     for i, phase in enumerate(phases):
         if [c["input"] for c in phase["commands"]] != PHASES[i]:
@@ -135,7 +136,7 @@ def validate(receipt, *, has_native_master):
         ["admin owner 0"] if has_native_master else [],
     ] or messages[1] != [["count 1/3"]]:
         raise ValueError("reply, blocking or state behavior differs")
-    event = phases[0]["trace"][2].copy()
+    event = next(row.copy() for row in phases[0]["trace"] if row["label"] == "inspect")
     event.pop("label")
     if messages[0][0] != [json.dumps(event, sort_keys=True)]:
         raise ValueError("event fields differ between trace and outgoing response")

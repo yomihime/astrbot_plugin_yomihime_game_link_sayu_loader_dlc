@@ -33,6 +33,20 @@ async def startup():
     trace("start")
 
 
+on_core_start(priority=40)(startup)
+
+
+@on_core_start(priority=90)
+async def startup_error():
+    trace("start-error")
+    raise RuntimeError("fixture startup hook failure")
+
+
+@on_core_start(priority=91)
+async def later_hook():
+    trace("unexpected-later-priority")
+
+
 @on_core_shutdown
 async def shutdown():
     trace("shutdown")

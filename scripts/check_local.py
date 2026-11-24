@@ -124,8 +124,8 @@ async def check(core, cases, list_commands=False):
             print(
                 route,
                 counts,
-                "skipped declarations",
-                sum(inventory["skipped"].values()),
+                "module import errors",
+                {name: error for name, error in inventory["modules"].items() if error},
             )
 
             if list_commands:

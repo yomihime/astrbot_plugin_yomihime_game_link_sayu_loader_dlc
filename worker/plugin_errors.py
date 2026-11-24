@@ -4,6 +4,8 @@ The native message table is distributed under GPL-3.0 with its license at
 licenses/gsuid_core-COPYING.txt. The default command_start is empty.
 """
 
+from typing import Dict, Optional, Union
+
 UID_HINT = "你还没有绑定过uid哦!\n请使用[绑定uid123456]命令绑定!"
 
 MYS_HINT = "你还没有绑定过mysid哦!\n请使用[绑定mys1234]命令绑定!"
@@ -70,7 +72,50 @@ def get_error(retcode, message=None):
     )
 
 
-async def get_error_img(retcode, force_image=False, message=None):
+def get_error_type(retcode: Union[int, str]) -> str:
+    retcode = int(retcode)
+    if retcode in [-51, 10104]:
+        return "绑定信息错误"
+    elif retcode in [-400, 400]:
+        return "MGGApi错误"
+    else:
+        return "Api错误"
+
+
+async def get_error_img(
+    retcode: Union[int, str],
+    force_image: bool = False,
+    message: Union[str, Dict, None] = None,
+) -> Union[bytes, str]:
+    error_message = get_error(retcode, message)
     if force_image:
-        raise NotImplementedError("native error artwork is unavailable")
-    return get_error(retcode, message)
+        error_type = get_error_type(retcode)
+        return await draw_error_img(retcode, error_message, error_type)
+    else:
+        return error_message
+
+
+async def draw_error_img(
+    retcode: Union[int, str] = 51233,
+    error_message: Optional[str] = None,
+    error_type: Optional[str] = None,
+) -> bytes:
+    if error_type is None:
+        error_type = "API报错"
+    if error_message is None:
+        error_message = "未知错误, 请检查控制台输出..."
+
+    from PIL import ImageDraw
+    from plugin_help import core_font
+    from plugin_image_tools import _asset, get_color_bg
+    from plugin_text_image import draw_center_text_by_line
+    from sayu_compat import convert_img
+
+    error_img = _asset("error_img.png")
+    img = await get_color_bg(*error_img.size, is_full=True, color=(228, 222, 210))
+    img.paste(error_img, (0, 0), error_img)
+    img_draw = ImageDraw.Draw(img)
+    img_draw.text((350, 646), error_type, "white", core_font(26), "mm")
+    img_draw.text((350, 695), f"错误码 {retcode}", "white", core_font(36), "mm")
+    draw_center_text_by_line(img_draw, (350, 750), error_message, core_font(30), "black", 440)
+    return await convert_img(img)

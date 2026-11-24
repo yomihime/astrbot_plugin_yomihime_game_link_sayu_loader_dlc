@@ -180,8 +180,9 @@ class PortsTests(unittest.TestCase):
 
     def test_thread_port_resolves_coroutines_on_another_thread(self):
         import threading
+        from gsuid_core.pool import to_thread
 
-        @host.to_thread
+        @to_thread
         async def compute():
             await asyncio.sleep(0)
             return threading.get_ident()
@@ -202,6 +203,7 @@ class PortsTests(unittest.TestCase):
         for part in ("..", "../another", str(self.root.resolve())):
             with self.assertRaises(ValueError):
                 host.get_res_path(["Example", part])
+        host.Plugins("Example", force_prefix=["ex"])
         self.assertEqual(host.get_plugin_available_prefix("Example"), "ex")
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             host.get_plugin_available_prefix("another")
