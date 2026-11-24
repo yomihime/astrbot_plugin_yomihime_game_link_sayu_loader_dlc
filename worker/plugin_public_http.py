@@ -2,6 +2,8 @@
 
 import http.client
 import ipaddress
+from functools import lru_cache
+from threading import Lock
 from pathlib import Path
 import re
 import socket
@@ -25,7 +27,10 @@ _IMAGE_URL = re.compile(
 
 
 class PublishedImages:
-    def __init__(self, source, plugin):
+    def __init__(self, source, plugin, *, verified_urls=None):
+        if verified_urls is not None:
+            self.urls = frozenset(verified_urls)
+            return
         self.urls = set()
         if source is None or not plugin or not plugin.isidentifier():
             return
@@ -51,8 +56,77 @@ class PublishedImages:
         return status, content
 
 
+@lru_cache(maxsize=1)
+def _verified_context():
+    # Each isolated reader process loads its system CA store once. All requests
+    # still authenticate their own hostname and connect to a checked numeric peer.
+    return ssl.create_default_context()
+
+
+class _IdleConnections:
+    """Only complete HTTP/1.1 responses may return a checked TLS socket."""
+
+    def __init__(self):
+        self.idle = []
+        self.lock = Lock()
+
+    def take(self, host, peers):
+        with self.lock:
+            for index in range(len(self.idle) - 1, -1, -1):
+                until, conn = self.idle[index]
+                if until <= monotonic() or conn.sock is None:
+                    self.idle.pop(index)
+                    conn.close()
+                elif conn.host == host:
+                    self.idle.pop(index)
+                    try:
+                        if ipaddress.ip_address(conn.sock.getpeername()[0]) in peers:
+                            return conn
+                    except OSError:
+                        pass
+                    conn.close()
+        return None
+
+    def put(self, conn):
+        with self.lock:
+            if len(self.idle) >= 5:
+                self.idle.pop(0)[1].close()
+            self.idle.append((monotonic() + 10, conn))
+
+
+_mirror_connections = _IdleConnections()
+
+
+def _open_checked(host, addresses, remaining):
+    context = _verified_context()
+    connection = http.client.HTTPSConnection(host, timeout=8, context=context)
+    connection.auto_open = False
+    last = None
+    for family, kind, proto, _, sockaddr in addresses:
+        peer = socket.socket(family, kind, proto)
+        try:
+            peer.settimeout(remaining(3))
+            peer.connect(sockaddr)
+            connection.sock = context.wrap_socket(peer, server_hostname=host)
+            return connection
+        except (ssl.SSLError, PermissionError):
+            peer.close()
+            raise
+        except OSError as exc:
+            peer.close()
+            last = exc
+    raise last
+
+
 def read_public_https(
-    url, limit, *, accept, skip_error_body=False, error_body_limit=0, deadline=None
+    url,
+    limit,
+    *,
+    accept,
+    skip_error_body=False,
+    error_body_limit=0,
+    deadline=None,
+    reuse_connection=False,
 ):
     from resource_broker import CLIENT
 
@@ -80,35 +154,29 @@ def read_public_https(
     peers = [ipaddress.ip_address(row[4][0]) for row in addresses]
     if not peers or any(not peer.is_global or peer.is_multicast for peer in peers):
         raise Unsupported("published image requires a public address")
-    connection = http.client.HTTPSConnection(target.hostname, timeout=8)
+    connection = (
+        _mirror_connections.take(target.hostname, peers) if reuse_connection else None
+    )
+    reused = connection is not None
     try:
-        # Connect to an already checked numeric peer. TLS still validates
-        # the publisher's DNS name and sends that name as SNI.
-        last = None
-        for family, kind, proto, _, sockaddr in addresses:
-            peer = socket.socket(family, kind, proto)
+        while True:
+            if connection is None:
+                connection = _open_checked(target.hostname, addresses, remaining)
             try:
-                peer.settimeout(remaining(3))
-                peer.connect(sockaddr)
-                connection.sock = ssl.create_default_context().wrap_socket(
-                    peer, server_hostname=target.hostname
+                connection.sock.settimeout(remaining(8))
+                connection.request(
+                    "GET",
+                    target.path or "/",
+                    headers={"Accept": accept, "Accept-Encoding": "identity"},
                 )
+                response = connection.getresponse()
                 break
-            except (ssl.SSLError, PermissionError):
-                peer.close()
-                raise
-            except OSError as exc:
-                peer.close()
-                last = exc
-        else:
-            raise last
-        connection.sock.settimeout(remaining(8))
-        connection.request(
-            "GET",
-            target.path or "/",
-            headers={"Accept": accept, "Accept-Encoding": "identity"},
-        )
-        response = connection.getresponse()
+            except (ConnectionResetError, BrokenPipeError):
+                if not reused:
+                    raise
+                connection.close()
+                connection = None
+                reused = False
         error_body = skip_error_body and response.status != 200
         if error_body:
             mime = (
@@ -145,6 +213,15 @@ def read_public_https(
                 raise Unsupported("published image exceeds the worker limit")
         if response.length not in (None, 0):
             raise http.client.IncompleteRead(body, response.length)
+        if (
+            reuse_connection
+            and response.status == 200
+            and not response.will_close
+            and connection.sock
+        ):
+            _mirror_connections.put(connection)
+            connection = None
         return response.status, response.getheaders(), bytes(body)
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()

@@ -918,7 +918,15 @@ def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
     install_pool(package)
     install_settings(package, _data_root, plugin)
     package("gsuid_core.utils.image")
-    published = PublishedImages(_source, plugin)
+    profile = sys.modules.get("game_profile")
+    published = PublishedImages(
+        _source,
+        plugin,
+        verified_urls=profile.STATIC_RESOURCE_URLS
+        if getattr(profile, "PUBLIC_RESOURCES_ONLY", False)
+        and profile.PACKAGE == plugin
+        else None,
+    )
     install_image_fetch(package, _data_root, published=published)
     tools = install_image_tools(package, _source, _data_root, fetch=published.fetch)
     tools.get_div = plugin_text_image.get_div

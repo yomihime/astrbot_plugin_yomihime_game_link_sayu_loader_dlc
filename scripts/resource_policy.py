@@ -22,6 +22,82 @@ def _values(fn, expression):
     ]
 
 
+def _constant_string(node, bindings):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    parts = []
+    for item in node.values:
+        if isinstance(item, ast.FormattedValue):
+            if (
+                item.conversion != -1
+                or item.format_spec
+                or not isinstance(item.value, ast.Name)
+            ):
+                return None
+            part = bindings.get(item.value.id)
+        elif isinstance(item, ast.Constant) and isinstance(item.value, str):
+            part = item.value
+        else:
+            return None
+        if part is None:
+            return None
+        parts.append(part)
+    return "".join(parts)
+
+
+def _static_table_images(tree):
+    """Resolve adjacent module-level literal tables without executing plugin code."""
+    bindings = {}
+    for statement in tree.body:
+        if not (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            bindings.clear()
+            continue
+        value = statement.value
+        # Calls, attribute lookups, comprehensions and assignments inside an
+        # expression can change names. Only descend into plain literal tables.
+        literal_types = (
+            ast.Constant,
+            ast.Name,
+            ast.Load,
+            ast.List,
+            ast.Tuple,
+            ast.Dict,
+            ast.JoinedStr,
+            ast.FormattedValue,
+        )
+        nodes = list(ast.walk(value))
+        if any(
+            not isinstance(n, literal_types)
+            or (isinstance(n, ast.Name) and n.id not in bindings)
+            or (
+                isinstance(n, ast.FormattedValue)
+                and (n.conversion != -1 or n.format_spec)
+            )
+            for n in nodes
+        ):
+            bindings.clear()
+            continue
+        for node in nodes:
+            if isinstance(node, ast.JoinedStr):
+                resolved = _constant_string(node, bindings)
+                if resolved and len(resolved) <= 2048 and IMAGE.fullmatch(resolved):
+                    yield resolved
+        text = _constant_string(value, bindings)
+        target = statement.targets[0].id
+        if text is not None and len(text) <= 2048:
+            bindings[target] = text
+        else:
+            bindings.pop(target, None)
+
+
 def from_snapshot(path, lock):
     images, directories = set(), set()
     with path.open("rb") as stream:
@@ -38,6 +114,7 @@ def from_snapshot(path, lock):
                 if b"https://" not in body and b"download_all_file" not in body:
                     continue
                 tree = ast.parse(body)
+                images.update(_static_table_images(tree))
                 fragments = {
                     id(value)
                     for n in ast.walk(tree)

@@ -9,8 +9,8 @@ import sys
 from tempfile import TemporaryDirectory
 from threading import Event
 from types import SimpleNamespace
-from unittest import IsolatedAsyncioTestCase
-from unittest.mock import patch
+from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
@@ -26,6 +26,63 @@ def listing(entries):
         + "".join(f'<a href="{n}">{n}</a> time {s}\n' for n, s in entries)
         + "</pre>"
     ).encode()
+
+
+class CheckedMirrorConnections(TestCase):
+    def test_reuse_requires_same_host_current_public_peer_and_complete_response(self):
+        import socket
+        from http.client import IncompleteRead
+        import plugin_public_http as public
+
+        host = "mirror.example.org"
+        url = f"https://{host}/manifest.json"
+
+        def response(body, missing=0):
+            reply = Mock(status=200, length=missing, will_close=False)
+            reply.getheader.return_value = "identity"
+            reply.getheaders.return_value = []
+            reply.read1.side_effect = [body, b""]
+            return reply
+
+        conn = Mock(host=host)
+        conn.sock.getpeername.return_value = ("8.8.8.8", 443)
+        conn.getresponse.side_effect = [
+            response(b"a"),
+            response(b"b"),
+            response(b"", missing=1),
+        ]
+        pool = public._IdleConnections()
+        dns = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 443))]
+        with (
+            patch.object(public, "_mirror_connections", pool),
+            patch.object(public.socket, "getaddrinfo", return_value=dns) as resolve,
+            patch.object(public, "_open_checked", return_value=conn) as opening,
+        ):
+            self.assertEqual(
+                public.read_public_https(url, 16, accept="*/*", reuse_connection=True)[
+                    2
+                ],
+                b"a",
+            )
+            self.assertIsNone(pool.take("other.example.org", []))
+            resolve.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))
+            ]
+            with self.assertRaises(Unsupported):
+                public.read_public_https(url, 16, accept="*/*", reuse_connection=True)
+            resolve.return_value = dns
+            self.assertEqual(
+                public.read_public_https(url, 16, accept="*/*", reuse_connection=True)[
+                    2
+                ],
+                b"b",
+            )
+            with self.assertRaises(IncompleteRead):
+                public.read_public_https(url, 16, accept="*/*", reuse_connection=True)
+            self.assertEqual(opening.call_count, 1)
+            self.assertEqual(resolve.call_count, 4)
+            self.assertEqual(pool.idle, [])
+            conn.close.assert_called_once()
 
 
 class DemandTest(IsolatedAsyncioTestCase):
@@ -233,3 +290,77 @@ class DemandTest(IsolatedAsyncioTestCase):
         with self.reads.scope():
             self.assertTrue((self.local / "plain.json").is_file())
         self.assertEqual(Path(self.local / "plain.json").read_bytes(), b"{}")
+
+    async def test_complete_multi_manifest_cache_and_changed_declaration(self):
+        self.reads.hash_route = "hash"
+        await self.declare({"wiki/art": self.local, "hash": self.local.parent / "hash"})
+        checks = self.base + "/Fixture/hash/"
+        first, second = b"{}", b"[]"
+        self.wire[self.index] = listing([("a.json", 2), ("b.json", 2), ("new.json", 2)])
+        self.wire[self.index + "a.json"] = first
+        self.wire[self.index + "b.json"] = self.wire[self.index + "new.json"] = second
+        manifests = [{"publisher_metadata": "revision-text"} for _ in range(17)]
+        manifests[0]["wiki/art/a.json"] = sha256(first).hexdigest()
+        manifests[-1]["wiki/art/b.json"] = sha256(second).hexdigest()
+
+        def publish():
+            files = []
+            for i, manifest in enumerate(manifests):
+                name = f"part-{i}.json"
+                raw = json.dumps(manifest).encode()
+                files.append((name, len(raw)))
+                self.wire[checks + name] = raw
+            self.wire[checks] = listing(files)
+
+        publish()
+        for name, value in (("a.json", first), ("b.json", second)):
+            with self.reads.scope():
+                self.assertEqual((self.local / name).read_bytes(), value)
+        self.assertEqual(
+            sum(n for url, n in self.calls.items() if url.startswith(checks)), 18
+        )
+        self.assertEqual(self.reads.counts["checksum_set_cache_hits"], 1)
+        # A newly published name is absent from the cached snapshot. Its new
+        # digest is checked before it can be considered an uncovered item.
+        manifests[-1]["wiki/art/new.json"] = sha256(first).hexdigest()
+        publish()
+        with (
+            self.reads.scope(),
+            self.assertRaisesRegex(Unsupported, "incorrect published checksum"),
+        ):
+            (self.local / "new.json").read_bytes()
+        self.assertFalse(Path(self.local / "new.json").exists())
+
+    async def test_conflicts_and_collection_limits_cannot_publish_files(self):
+        self.reads.hash_route = "hash"
+        await self.declare({"wiki/art": self.local, "hash": self.local.parent / "hash"})
+        checks = self.base + "/Fixture/hash/"
+        self.wire[self.index] = listing([("a.json", 2)])
+        self.wire[self.index + "a.json"] = b"{}"
+        raw = (
+            '{"wiki/art/a.json":"'
+            + "0" * 64
+            + '","wiki/art/a.json":"'
+            + "1" * 64
+            + '"}'
+        ).encode()
+        self.wire[checks + "one.json"] = raw
+        cases = [
+            (listing([("one.json", len(raw))]), "conflicting"),
+            (listing([(f"item-{i}.json", 2) for i in range(65)]), "collection exceeds"),
+            (
+                listing([(f"item-{i}.json", 4 * 1024 * 1024) for i in range(3)]),
+                "collection exceeds",
+            ),
+            (listing([("one.json", 2), ("one.json", 2)]), "duplicate"),
+        ]
+        for index, message in cases:
+            self.wire[checks] = index
+            with (
+                self.subTest(message=message),
+                self.reads.scope(),
+                self.assertRaisesRegex(Unsupported, message),
+            ):
+                (self.local / "a.json").read_bytes()
+            self.assertFalse(Path(self.local / "a.json").is_file())
+            self.assertFalse(self.reads.checksums)

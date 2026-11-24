@@ -14,6 +14,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "worker")]
 from port_errors import Unsupported  # noqa: E402
+from plugin_public_http import PublishedImages  # noqa: E402
 from resource_broker import MAX_FILE, MAX_INDEX, allowed, fetch  # noqa: E402
 from resource_policy import from_snapshot  # noqa: E402
 import resource_broker  # noqa: E402
@@ -101,6 +102,12 @@ class BrokerTest(TestCase):
                     "Fixture/plugin.py",
                     "from gsuid_core.utils.download_resource.download_core import download_all_file as load\n"
                     "icon='https://publisher.example.org/a.png'\n"
+                    "origin='https://publisher.example.org'\n"
+                    "album=f'{origin}/static'\n"
+                    "art={'cover': f'{album}/cover.png', 'tiles': [f'{album}/tile.jpg']}\n"
+                    "dynamic=f'{album}/{user_input}.png'\n"
+                    "if supplied: album = custom_album\n"
+                    "uncertain=f'{album}/after_branch.png'\n"
                     "async def fetch():\n"
                     " mapping={'wiki/art':ART, f'build/{PLATFORM}':BIN}\n"
                     " other={'ignored/dir': DATA}\n"
@@ -112,10 +119,29 @@ class BrokerTest(TestCase):
             }
             self.assertEqual(
                 from_snapshot(archive, lock),
-                (["https://publisher.example.org/a.png"], ["wiki/art"]),
+                (
+                    [
+                        "https://publisher.example.org/a.png",
+                        "https://publisher.example.org/static/cover.png",
+                        "https://publisher.example.org/static/tile.jpg",
+                    ],
+                    ["wiki/art"],
+                ),
             )
             with self.assertRaises(ValueError):
                 from_snapshot(archive, dict(lock, snapshot_sha256="0" * 64))
+
+    def test_image_helpers_and_broker_use_the_same_exact_url_set(self):
+        image = self.profile.STATIC_RESOURCE_URLS[0]
+        catalog = PublishedImages(None, "Fixture", verified_urls=[image])
+        with patch(
+            "plugin_public_http.read_public_https", return_value=(200, [], b"image")
+        ) as read:
+            self.assertEqual(catalog.fetch(image), (200, b"image"))
+            self.assertEqual(allowed(image, self.profile)[0], "image")
+            with self.assertRaises(Unsupported):
+                catalog.fetch(image.replace("logo.png", "unpublished.png"))
+            read.assert_called_once()
 
     def test_isolated_reader_serves_static_bytes_while_plugin_network_is_denied(self):
         with TemporaryDirectory() as tmp:

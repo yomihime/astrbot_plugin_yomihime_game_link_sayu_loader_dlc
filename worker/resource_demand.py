@@ -1,16 +1,18 @@
 """Resolve actual reads beneath this generation's declared static mirror folders."""
 
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 from hashlib import sha256
 import os
+import re
 from pathlib import Path
 import ssl
 import sys
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from urllib.parse import quote, unquote
 
@@ -21,6 +23,10 @@ from port_errors import Unsupported
 _scope = ContextVar("private_static_read", default=None)
 _installed = False
 _extensions = {".json", ".png", ".jpg", ".jpeg", ".webp"}
+_digest = re.compile(r"[0-9a-f]{64}")
+_manifest_file_cap = 64
+_manifest_bytes_cap = 8 * 1024 * 1024
+_manifest_entry_cap = 65_536
 
 
 class ResourcePath(type(Path())):
@@ -83,10 +89,12 @@ class ResourceReads:
         self.root = downloads.root / "resources" / profile.PACKAGE
         self.namespace = "/" + quote(segment(profile.PACKAGE)) + "/"
         self.routes = frozenset(profile.STATIC_RESOURCE_DIRECTORIES)
+        self.hash_prefixes = tuple(route + "/" for route in self.routes)
         self.hash_route = getattr(profile, "SHA256_MANIFEST_DIRECTORY", None)
         self.reader = reader
         self.folders = {}
         self.indexes = OrderedDict()
+        self.checksums = OrderedDict()
         self.counts = Counter()
         self.closed = False
         self.serial = Lock()
@@ -189,9 +197,9 @@ class ResourceReads:
             raise Unsupported("static read exceeds its byte limit")
         return data
 
-    def _index(self, url, deadline):
+    def _index(self, url, deadline, *, fresh=False):
         cached = self.indexes.get(url)
-        if cached and monotonic() < cached[0]:
+        if not fresh and cached and monotonic() < cached[0]:
             self.indexes.move_to_end(url)
             return cached[1]
         data = self._read(url, 256 * 1024, deadline)
@@ -291,33 +299,95 @@ class ResourceReads:
         if not any(route == self.hash_route for route, _ in self.folders.values()):
             raise Unsupported("upstream checksum directory was not declared")
         directory = origin + self.namespace + self.hash_route + "/"
-        listing = self._index(directory, lease.end)
-        if listing is None or len(listing) > 16:
-            raise Unsupported("published checksum index unavailable or too large")
-        expected = set()
+        stamp = self.checksums.get(directory)
+        actual = sha256(data).digest()
+        if stamp and monotonic() < stamp[0] and stamp[1].get(source_key) == actual:
+            self.checksums.move_to_end(directory)
+            self.counts["checksum_set_cache_hits"] += 1
+            return
+        # A cached miss or mismatch cannot authorize a newly published file.
+        digests = self._load_checksums(directory, lease)
+        self.checksums[directory] = (monotonic() + 60, digests)
+        if len(self.checksums) > 2:
+            self.checksums.popitem(last=False)
+        self.counts["checksum_sets_loaded"] += 1
+        expected = digests.get(source_key)
+        if expected is not None and expected != actual:
+            self.counts["unverified_checksum"] += 1
+            raise Unsupported("incorrect published checksum")
+
+    def _load_checksums(self, directory, lease):
+        listing = self._index(directory, lease.end, fresh=True)
+        if listing is None:
+            raise Unsupported("published checksum directory unavailable")
+        files = {}
         for href, length in listing:
-            if not href.endswith(".json"):
+            if not href.lower().endswith(".json"):
                 continue
             name = segment(unquote(href, errors="strict"))
             if not length.isascii() or not length.isdecimal() or len(length) > 8:
                 raise Unsupported("invalid published checksum file size")
             size = int(length)
-            if size > 4 * 1024 * 1024 or lease.bytes + size > 24 * 1024 * 1024:
-                raise Unsupported("published checksum data exceeds budget")
-            lease.bytes += size
+            if name in files or size > 4 * 1024 * 1024:
+                raise Unsupported("duplicate or oversized published checksum file")
+            files[name] = size
+        total = sum(files.values())
+        if (
+            len(files) > _manifest_file_cap
+            or total > _manifest_bytes_cap
+            or lease.bytes + total > 24 * 1024 * 1024
+        ):
+            raise Unsupported("published checksum collection exceeds budget")
+        lease.bytes += total
+
+        cancelled = Event()
+
+        def load(item):
+            if cancelled.is_set() or self.closed or not lease.active:
+                raise Unsupported("static read retired")
+            name, size = item
             raw = self._read(directory + quote(name), size, lease.end)
             if raw is None or len(raw) != size:
                 raise Unsupported("incomplete published checksum data")
-            manifest = json.loads(raw)
-            if not isinstance(manifest, dict):
-                raise Unsupported("invalid checksum manifest")
-            if source_key in manifest:
-                digest = manifest[source_key]
-                if not isinstance(digest, str) or len(digest) != 64:
-                    raise Unsupported("invalid published checksum")
-                expected.add(digest)
-        # The native verifier iterates manifest entries. An item absent from
-        # the entire verified set has no additional digest requirement.
-        if expected and expected != {sha256(data).hexdigest()}:
-            self.counts["unverified_checksum"] += 1
-            raise Unsupported("conflicting or incorrect published checksum")
+            return raw
+
+        # Four reads leave one of the five broker slots available for the
+        # concurrent upstream bulk request. Every transfer has the same deadline.
+        digests = {}
+        entries = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = [pool.submit(load, item) for item in files.items()]
+            try:
+                for result in results:
+                    # Preserve duplicate members for conflict detection; arrays
+                    # and nested objects cannot stand in for a SHA-256 value.
+                    pairs = json.loads(result.result(), object_pairs_hook=tuple)
+                    if not isinstance(pairs, tuple):
+                        raise Unsupported("invalid checksum manifest")
+                    entries += len(pairs)
+                    if entries > _manifest_entry_cap:
+                        raise Unsupported("published checksum entry limit exceeded")
+                    for key, value in pairs:
+                        # Native resolve_local_path ignores metadata and paths
+                        # outside registered roots before looking at the digest.
+                        if not key.startswith(self.hash_prefixes) or ".." in key.split(
+                            "/"
+                        ):
+                            continue
+                        if (
+                            len(key) > 1024
+                            or not isinstance(value, str)
+                            or not _digest.fullmatch(value)
+                        ):
+                            raise Unsupported("invalid published checksum record")
+                        digest = bytes.fromhex(value)
+                        if digests.setdefault(key, digest) != digest:
+                            self.counts["unverified_checksum"] += 1
+                            raise Unsupported("conflicting published checksum")
+            finally:
+                cancelled.set()
+                for result in results:
+                    result.cancel()
+        if self.closed or not lease.active or monotonic() >= lease.end:
+            raise TimeoutError("checksum set validation did not complete in time")
+        return digests

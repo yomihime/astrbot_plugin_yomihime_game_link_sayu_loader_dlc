@@ -162,6 +162,13 @@ def fetch(url, limit, profile, deadline=None):
     # only complete, small text/JSON error bodies from its source-literal assets.
     source_literal = url in profile.STATIC_RESOURCE_URLS
     error_policy = {"error_body_limit": 8192} if source_literal else {}
+    if getattr(profile, "SHA256_MANIFEST_DIRECTORY", None) and any(
+        url.startswith(base + "/" + profile.PACKAGE + "/")
+        for base in profile.PUBLIC_BULK_MIRRORS
+    ):
+        # A digest set spans multiple anonymous GETs to the same public mirror.
+        # DNS and the established socket peer are checked on every reuse.
+        timing["reuse_connection"] = True
     status, raw_headers, data = read_public_https(
         url,
         min(limit, ceiling),
