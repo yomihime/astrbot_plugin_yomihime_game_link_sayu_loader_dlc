@@ -26,6 +26,7 @@ from sqlmodel import Field, SQLModel
 from port_errors import Unsupported
 import plugin_bindings
 from plugin_orm_bind import BIND_ERROR, guard_bind, permits_bind, uid_columns
+from plugin_orm_cache import call_cache, check_cache_call
 from plugin_orm_accounts import (
     ACCOUNT_ERROR,
     account_columns,
@@ -60,6 +61,8 @@ class Access:
     preference: tuple[str, frozenset[str]] | None = None
     binding: tuple[str, frozenset[str]] | None = None
     account: tuple[str, dict[str, str]] | None = None
+    cache: bool = False
+    checking_cache_owner: bool = False
 
     def check(self):
         if self.root is not _runtime or asyncio.current_task() is not self.task:
@@ -86,7 +89,7 @@ def session_decorator(function, read_only):
 
     @wraps(function)
     async def wrapper(self, *args, **kwargs):
-        access = _runtime.access(read_only, self)
+        access = _runtime.access(read_only, self, function)
         if not access.startup:
             values = signature.bind(self, None, *args, **kwargs).arguments
             _validate_values(access.origin, values)
@@ -97,6 +100,8 @@ def session_decorator(function, read_only):
         if bound is not None:
             session, previous = bound
             previous.check()
+            if access.cache or previous.cache:
+                raise Unsupported("credential cache requires its own owner transaction")
             if read_only:
                 return await function(self, session, *args, **kwargs)
             async with session.begin_nested():
@@ -114,7 +119,12 @@ def session_decorator(function, read_only):
                             for row in sync_session.new.union(sync_session.dirty):
                                 _validate_values(access.origin, vars(row))
 
-                    result = await function(self, session, *args, **kwargs)
+                    if access.cache:
+                        result = await call_cache(
+                            access, function, self, session, values, args, kwargs
+                        )
+                    else:
+                        result = await function(self, session, *args, **kwargs)
                     access.check()
                     await session.commit()
                     return result
@@ -174,6 +184,7 @@ class PluginORM:
         self.bind_tables = set()
         self.accounts = {}
         self.account_tables = set()
+        self.cache_tables = set()
 
     def path(self, name):
         path = self.root / name
@@ -210,9 +221,14 @@ class PluginORM:
             boot.writable = False
             _boot.reset(token)
 
-    def access(self, read_only=False, model=None):
+    def access(self, read_only=False, model=None, function=None):
         task = asyncio.current_task()
         owner = plugin_bindings._current.get()
+        from plugin_orm_models import Cache
+
+        cache = isinstance(model, type) and issubclass(model, Cache)
+        if cache and (owner is None or not owner.account_records):
+            raise Unsupported(ACCOUNT_ERROR)
         if owner is None:
             grant = _boot.get()
             if grant is None or not grant.writable:
@@ -222,6 +238,8 @@ class PluginORM:
             )
         if not owner.active or getattr(owner, "task", None) is not task:
             raise Unsupported("database requires the active private owner task")
+        if cache:
+            check_cache_call(model, function)
         identity = json.dumps([owner.adapter, owner.actor], ensure_ascii=True).encode()
         path = self.path(hashlib.sha256(identity).hexdigest() + ".sqlite3")
         preference = None
@@ -234,8 +252,10 @@ class PluginORM:
             preference = self.preferences.get(model)
         binding = None
         account = None
-        if not owner.writable and isinstance(model, type) and model in self.accounts:
-            account = self.accounts[model]
+        if cache or (
+            not owner.writable and isinstance(model, type) and model in self.accounts
+        ):
+            account = self.accounts.get(model)
             if not owner.account_records or account is None:
                 raise Unsupported(ACCOUNT_ERROR)
         if not owner.writable and isinstance(model, type) and model in self.bindings:
@@ -255,7 +275,7 @@ class PluginORM:
             else:
                 path = template
         return Access(
-            self, path, write, False, owner, task, preference, binding, account
+            self, path, write, False, owner, task, preference, binding, account, cache
         )
 
     def publish_empty_schema(self):
@@ -359,7 +379,30 @@ class PluginORM:
                     access.preference, action, first, second, database, trigger
                 )
             if action in _DML or action == sqlite3.SQLITE_READ:
-                if access.account:
+                if access.checking_cache_owner:
+                    allowed = (
+                        action == sqlite3.SQLITE_READ
+                        and database == "main"
+                        and (first or "").casefold() == "gsuser"
+                        and not trigger
+                        and second
+                        in {
+                            "id",
+                            "user_id",
+                            "bot_id",
+                            "cookie",
+                            "uid",
+                            "sr_uid",
+                            "mys_id",
+                        }
+                    )
+                elif (
+                    not access.startup
+                    and not access.cache
+                    and (first or "").casefold() in self.cache_tables
+                ):
+                    allowed = False
+                elif access.account:
                     allowed = permits_account(
                         access, action, first, second, database, trigger
                     )
@@ -392,6 +435,16 @@ class PluginORM:
                 connection.run_async(lambda driver: guard_bind(driver, access))
             if access.account:
                 connection.run_async(lambda driver: guard_account(driver, access))
+            if access.cache:
+                from plugin_account_models import GsUser
+                from plugin_orm_preferences import guard_physical_table
+
+                table, columns = self.accounts[GsUser]
+                connection.run_async(
+                    lambda driver: guard_physical_table(
+                        driver, table, columns.keys(), column_types=columns
+                    )
+                )
             connection.run_async(lambda driver: driver.set_authorizer(authorize))
 
         @event.listens_for(db.sync_engine, "begin")
@@ -442,6 +495,7 @@ class PluginORM:
         base_id = sys.modules["gsuid_core.utils.database.base_models"].BaseIDModel
         bind = sys.modules["gsuid_core.utils.database.base_models"].Bind
         user = sys.modules["gsuid_core.utils.database.base_models"].User
+        cache = sys.modules["gsuid_core.utils.database.base_models"].Cache
         tables = {models.Subscribe.__table__, models.CoreUser.__table__}
         todo = list(SQLModel.__subclasses__())
         seen = set()
@@ -453,12 +507,14 @@ class PluginORM:
             todo.extend(cls.__subclasses__())
             table = getattr(cls, "__table__", None)
             if table is not None and (
-                cls in (models.GsUser, models.GsUID)
+                cls in (models.GsUser, models.GsUID, models.GsCache)
                 or cls.__module__.startswith(prefix)
                 or cls.__module__ in (self.plugin, "plugins." + self.plugin)
             ):
                 tables.add(table)
-                if issubclass(cls, user) or cls is models.GsUID:
+                if issubclass(cls, cache):
+                    self.cache_tables.add(table.name.casefold())
+                if issubclass(cls, (user, cache)) or cls is models.GsUID:
                     self.accounts[cls] = account_columns(table)
                     self.account_tables.add(table.name.casefold())
                 if issubclass(cls, bind):
@@ -536,7 +592,7 @@ class PluginORM:
 def install_orm(package, data_root, plugin):
     global _runtime
     import plugin_orm_models as native
-    from plugin_account_models import GsUser, GsUID
+    from plugin_account_models import GsCache, GsUser, GsUID
     from plugin_core_user import CoreUser
 
     class Subscribe(native.BaseModel, table=True):
@@ -565,7 +621,7 @@ def install_orm(package, data_root, plugin):
 
     _runtime = PluginORM(data_root, plugin)
     base = package("gsuid_core.utils.database.base_models")
-    for name in ("BaseIDModel", "BaseBotIDModel", "BaseModel", "Bind", "User"):
+    for name in ("BaseIDModel", "BaseBotIDModel", "BaseModel", "Bind", "User", "Cache"):
         setattr(base, name, getattr(native, name))
     base.with_session = with_session
     base.with_read_session = with_read_session
@@ -573,6 +629,7 @@ def install_orm(package, data_root, plugin):
     package("gsuid_core.utils.database.startup").exec_list = _runtime.migrations
     models = sys.modules["gsuid_core.utils.database.models"]
     models.GsUser, models.GsUID = GsUser, GsUID
+    models.GsCache = GsCache
     models.Subscribe = Subscribe
     models.CoreUser = CoreUser
     return _runtime

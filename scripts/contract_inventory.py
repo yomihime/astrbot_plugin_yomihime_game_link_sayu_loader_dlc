@@ -170,6 +170,16 @@ def proof_index():
             "utils.api.mys.api.ApiEndpoint.get",
         ],
         "mys_read_error_contract": ["utils.api.mys.base_request.BaseMysApi._mys_request"],
+        "cache_contract": [
+            "utils.database.models.GsCache",
+            *(
+                "utils.database.base_models.Cache." + name
+                for name in (
+                    "select_cache_cookie", "insert_cache_data", "refresh_cache",
+                    "delete_error_cache", "delete_all_cache",
+                )
+            ),
+        ],
         "account_enumeration_contract": [
             "utils.database.base_models." + name
             for name in (
@@ -327,6 +337,7 @@ PROBE_LIMITS = {
     "layout": "Pinned ordinary and meta-plugin layouts; cross-profile imports require a host grant.",
     "message": "Compared wire models and message segments; delivery acknowledgments depend on the adapter.",
     "orm": "Compared private SQLite models and sessions. Owner partitions and the outermost savepoint differ.",
+    "cache": "Compared owned credential cache reads, writes, role refresh and rollback. Cross-table cleanup is explicitly denied.",
     "image_tools": "Compared fixed drawing inputs, pixels and exceptions. Inputs and rendered surfaces are bounded.",
     "mys_account": "Isolated credentials and controlled HTTP. No production login, signing issuer or service acceptance.",
     "mys_read_error": "Owner's read-only GET, connection refusal, malformed response, ordered messages, and no-Bot failure. Uncertain requests are not replayed.",

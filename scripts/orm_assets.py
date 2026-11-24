@@ -13,8 +13,8 @@ PATH = "gsuid_core/utils/database/base_models.py"
 DIGEST = "b8f734e4c17f67a58f7ca02ac6ff9d3a8eba6b886701905303e74be0211daba2"
 ACCOUNT_PATH = "gsuid_core/utils/database/models.py"
 ACCOUNT_DIGEST = "83a2f078e6373106b62519c48b958e937d13dc956a42f08405b088dbcecbcb4a"
-CLASSES = ("BaseIDModel", "BaseBotIDModel", "BaseModel", "Bind", "User")
-PRELUDE = '''"""Five native SQLModel classes from Genshin-bots/gsuid_core, commit
+CLASSES = ("BaseIDModel", "BaseBotIDModel", "BaseModel", "Bind", "User", "Cache")
+PRELUDE = '''"""Native SQLModel classes from Genshin-bots/gsuid_core, commit
 96cd7353be3100ff982bccc33e554961837c778e. Source gsuid_core/utils/database/base_models.py.
 GPL-3.0, see licenses/gsuid_core-COPYING.txt. Session and driver supplied by Loader.
 """
@@ -33,6 +33,7 @@ T_BaseModel = TypeVar("T_BaseModel", bound="BaseModel")
 T_BaseIDModel = TypeVar("T_BaseIDModel", bound="BaseIDModel")
 T_User = TypeVar("T_User", bound="User")
 T_Bind = TypeVar("T_Bind", bound="Bind")
+T_Cache = TypeVar("T_Cache", bound="Cache")
 _UPSERT_CHUNK = 400
 _db_type = "sqlite"
 '''
@@ -86,15 +87,15 @@ def verified_orm_models(reference=None):
     declarations = [
         ast.get_source_segment(accounts, cls)
         for cls in ast.parse(accounts).body
-        if isinstance(cls, ast.ClassDef) and cls.name in ("GsUser", "GsUID")
+        if isinstance(cls, ast.ClassDef) and cls.name in ("GsUser", "GsUID", "GsCache")
     ]
-    if len(declarations) != 2:
+    if len(declarations) != 3:
         raise ValueError("missing native account declarations")
     account_models = (
         '"""Pinned gsuid_core account declarations. GPL-3.0, see licenses/gsuid_core-COPYING.txt."""\n'
         "from typing import Optional\nfrom sqlmodel import Field, select, update, or_\n"
         "from sqlalchemy.ext.asyncio import AsyncSession\n"
-        "from plugin_orm import with_session\nfrom plugin_orm_models import BaseIDModel, User\n\n"
+        "from plugin_orm import with_session\nfrom plugin_orm_models import BaseIDModel, Cache, User\n\n"
         + "\n\n".join(declarations)
         + "\n"
     )
