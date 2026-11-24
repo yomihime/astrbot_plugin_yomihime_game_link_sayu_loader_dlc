@@ -228,15 +228,18 @@ class Module:
                 reads = None
                 context = owner_context if owner_context is not None else invocation_context
                 if context is not None and self.key in PROFILE_MODULES:
-                    if (getattr(context, "module_id", None) != PROFILE_MODULES[self.key]
-                            or context.capability_id != request.get("capability_id")):
+                    route = PROFILE_MODULES[self.key]
+                    if (
+                        context.module_id != f"sayu_loader/{route}"
+                        or context.capability_id != request.get("capability_id")
+                    ):
                         raise ygl.AccessDenied()
                     if scope is None:
                         scope = await self.services.scopes.bind(context)
                     if scope.invocation is not context:
                         raise ygl.AccessDenied()
                     nonce = os.urandom(16).hex()
-                    reads = AnonymousReads(context.module_id, nonce, scope.http)
+                    reads = AnonymousReads(route, nonce, scope.http)
                     request["anonymous_invocation"] = nonce
                 encoded = (
                     json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"

@@ -75,13 +75,26 @@ async def check(core, cases, list_commands=False):
                 assert capability.invocation_policy.value == "command_only"
         modules = {}
         handlers = {}
+        contexts = {}
 
         async def start(route):
             meta = manifests[route]
             mod, factory = meta.factory_entry.split(":")
+            contexts[route] = context = sdk.InvocationView(
+                f"regression-{route}", sdk.InvocationOrigin.COMMAND,
+                "fixture-owner", "fixture-dm", manifest.global_module_id(meta.module_id),
+                1, 1, adapter_id="fixture", capability_id="query",
+                conversation_kind=sdk.InvocationConversationKind.DIRECT,
+            )
+
+            async def bind(view):
+                if view is not context:
+                    raise sdk.AccessDenied()
+                return SimpleNamespace(invocation=view, http=SimpleNamespace())
+
             instance = await getattr(
                 importlib.import_module("sayu_loader." + mod), factory
-            )().create(None)
+            )().create(SimpleNamespace(scopes=SimpleNamespace(bind=bind)))
             await instance.start()
             cleanup.push_async_callback(instance.stop)
             ports = instance.handlers().capabilities
@@ -90,7 +103,7 @@ async def check(core, cases, list_commands=False):
             handlers[route] = ports["query"]
 
         async def invoke(route, text):
-            result = validate(await handlers[route].invoke(None, {"text": text}))
+            result = validate(await handlers[route].invoke(contexts[route], {"text": text}))
             assert result.status == sdk.ResultStatus.SUCCESS, (route, result.error)
             return result.document
 
@@ -213,7 +226,7 @@ async def check(core, cases, list_commands=False):
             sdk.InvocationOrigin.COMMAND,
             "sample-user",
             "sample-dm",
-            "sayugs",
+            manifest.global_module_id(manifests["sayugs"].module_id),
             1,
             1,
             adapter_id="fixture",
@@ -253,7 +266,7 @@ async def check(core, cases, list_commands=False):
             ("sayugs", "ww抽卡帮助"),
             ("sayuww", "sr三月七别名"),
         ):
-            negative = await handlers[route].invoke(None, {"text": text})
+            negative = await handlers[route].invoke(contexts[route], {"text": text})
             assert negative.status == sdk.ResultStatus.ERROR
         # A stopped generation must reject its existing handler. Its sibling still works.
         retired = handlers["sayusr"]

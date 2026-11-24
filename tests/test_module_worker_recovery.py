@@ -152,7 +152,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         context = SimpleNamespace(
-            module_id="sayuww", capability_id="account", deadline=None
+            module_id="sayu_loader/sayuww", capability_id="account", deadline=None
         )
         scope = SimpleNamespace(invocation=context, http=SimpleNamespace(fetch=source))
         self.module.services = SimpleNamespace(
@@ -164,6 +164,12 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 {"text": label, "capability_id": "account"}, invocation_context=context
             )
 
+        for foreign in ("sayuww", "other/sayuww", "sayu_loader/sayugs"):
+            with self.subTest(module_id=foreign), patch.object(context, "module_id", foreign):
+                with self.assertRaises(self.adapter.ygl.AccessDenied):
+                    await invoke("anonymous-foreign")
+        self.assertFalse(self.records("anonymous-foreign"))
+        self.module.services.scopes.bind.assert_not_awaited()
         self.assertEqual((await invoke("anonymous-twice"))["parts"], [{"text": "done"}])
         self.assertEqual(source.await_count, 2)
         with self.assertRaises(ValueError):

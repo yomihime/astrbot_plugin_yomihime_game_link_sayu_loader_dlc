@@ -52,6 +52,7 @@ class OfflineReads:
         declarations = next(
             m.sources for m in manifest.modules if m.module_id == "sayuww"
         )
+        self.module_id = manifest.global_module_id("sayuww")
         rules = import_module("sayu_loader.sayu.anonymous_sources").SOURCES["sayuww"]
         assert {src.source_id: src.host for src in declarations} == {
             key: rule[0] for key, rule in rules.items()
@@ -78,7 +79,7 @@ class OfflineReads:
             return self.sdk.HttpResponse(response[0], {}, response[1])
 
         self.http = load("infrastructure.http").SourceHttpService(
-            declarations, transport, module_id="sayuww"
+            declarations, transport, module_id=self.module_id
         )
         self.bound = load("services.module_services")._BoundHttp
 

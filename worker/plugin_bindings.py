@@ -153,6 +153,13 @@ class GsBind:
             return cls._from_storage(dict(row)) if row else None
 
     @classmethod
+    async def select_data_list(cls, user_id, bot_id=None):
+        # This profile's binding key is (actor, adapter). Omitted adapters use
+        # the current delivery, as in select_data.
+        row = await cls.select_data(user_id, bot_id)
+        return [row] if row is not None else None
+
+    @classmethod
     async def bind_exists(cls, user_id, bot_id):
         return bool(await cls.select_data(user_id, bot_id))
 

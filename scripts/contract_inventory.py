@@ -286,6 +286,7 @@ def proof_index():
         ],
         "binding_contract": [
             "utils.database.models.GsBind",
+            "utils.database.base_models.BaseModel.select_data_list",
             "utils.database.api.get_uid",
             "utils.api.mys.base_request.BaseMysApi.get_overseas_device_id",
             "utils.api.mys.base_request.BaseMysApi.get_overseas_device_fp",

@@ -153,6 +153,71 @@ async def enrollment_without_exchange(inputs):
     return receipt
 
 
+async def binding_list_probe(mode, phase, model):
+    from sqlalchemy import inspect
+
+    owner, other = "list-owner", "list-other"
+    second_adapter = "list-second-adapter"
+
+    def scope(actor, adapter, **options):
+        if mode == "native":
+            return nullcontext()
+        from plugin_bindings import binding_scope
+
+        return binding_scope(actor, adapter, True, **options)
+
+    async def denied(operation):
+        try:
+            await operation
+        except NotImplementedError:
+            return
+        raise AssertionError("binding list escaped its current delivery")
+
+    if phase == "write":
+        with scope(owner, BOT):
+            assert await model.select_data_list(owner, BOT) is None
+        for actor, adapter, uid in (
+            (owner, BOT, "000090001"),
+            (owner, second_adapter, "000090002"),
+            (other, BOT, "000090003"),
+        ):
+            with scope(actor, adapter, uid_write=True):
+                assert await model.insert_uid(actor, adapter, uid) == 0
+    observations = []
+    for actor, adapter in ((owner, BOT), (owner, second_adapter), (other, BOT)):
+        with scope(actor, adapter):
+            rows = await model.select_data_list(actor, adapter)
+            assert isinstance(rows, list) and len(rows) == 1
+            row = rows[0]
+            assert isinstance(row, model) and inspect(row).detached
+            single = await model.select_data(actor, adapter)
+            original = row.model_dump()
+            assert original == single.model_dump()
+            observations.append(original)
+            row.uid = "detached-only"
+            assert (await model.select_data_list(actor, adapter))[0].model_dump() == original
+
+    with scope(owner, BOT):
+        rows = await model.select_data_list(owner)
+        observed_adapters = sorted(row.bot_id for row in rows)
+        expected = [BOT, second_adapter] if mode == "native" else [BOT]
+        assert observed_adapters == sorted(expected)
+        if mode == "loader":
+            for operation in (
+                model.select_data_list(other, BOT),
+                model.select_data_list(other),
+                model.select_data_list(owner, second_adapter),
+                asyncio.create_task(model.select_data_list(owner, BOT)),
+            ):
+                await denied(operation)
+            delayed = model.select_data_list(owner)
+    if mode == "loader":
+        await denied(delayed)
+        with scope(owner, BOT, uid_read=False):
+            await denied(model.select_data_list(owner))
+    return observations, observed_adapters
+
+
 async def probe(mode, phase, worker):
     from native_contract import offline
 
@@ -260,6 +325,7 @@ async def probe(mode, phase, worker):
             with binding_scope(actor, adapter, private):
                 for operation in (
                     GsBind.get_uid_by_game(ACTOR, BOT),
+                    GsBind.select_data_list(ACTOR, BOT),
                     GsBind.delete_uid(ACTOR, BOT, "000000002"),
                     get_all_bind_uid(BOT, ACTOR),
                 ):
@@ -269,6 +335,9 @@ async def probe(mode, phase, worker):
                         pass
                     else:
                         raise AssertionError("owner data escaped its invocation scope")
+    result["binding_list_rows"], result["list_without_adapter"] = await binding_list_probe(
+        mode, phase, GsBind
+    )
     return result
 
 
@@ -329,6 +398,12 @@ def main():
                     subprocess.run(command, cwd=work, env=env, check=True, timeout=45)
                     phases.append(json.loads(log.read_bytes()))
                 result[mode] = phases
+        # Native queries every adapter when bot_id is absent. Keep the measured
+        # results for both engines while comparing explicit-adapter rows directly.
+        result["list_without_adapter"] = {
+            mode: [phase.pop("list_without_adapter") for phase in result[mode]]
+            for mode in ("native", "loader")
+        }
         if result["native"] != result["loader"]:
             raise AssertionError(result)
         result["owner_denials_verified"] = True

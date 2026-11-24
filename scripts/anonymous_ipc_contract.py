@@ -56,6 +56,7 @@ def worker_main(archive, source, data):
 
 
 async def check(package, digest, core):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from anonymous_account_fixture import OfflineReads
 
     if sha256(package.read_bytes()).hexdigest() != digest:
@@ -86,7 +87,7 @@ async def check(package, digest, core):
             "command",
             "fixture-owner",
             "fixture-private",
-            "sayuww",
+            fixture.module_id,
             1,
             1,
             deadline=deadline,
