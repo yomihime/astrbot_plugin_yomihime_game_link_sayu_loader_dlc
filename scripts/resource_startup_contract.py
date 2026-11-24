@@ -77,6 +77,7 @@ async def exercise(core, serial, observe_seconds=0):
                 "static_httpx": inventory["public_static_httpx"],
                 "download_counts": inventory["downloads"]["counts"],
                 "downloaded_bytes": inventory["downloads"]["bytes_written"],
+                "on_demand": inventory["downloads"]["on_demand"],
                 "continuations_at_ready": inventory["downloads"]["continuations"],
             }
 

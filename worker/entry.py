@@ -24,6 +24,7 @@ class Worker:
         self.source = source
         self.data = data
         self.plugin = PluginRuntime(self.data)
+        self.reads = None
 
     async def start(self):
         self.downloads = sayu_compat.install(
@@ -31,7 +32,14 @@ class Worker:
         )
         if RUNTIME_MODE != "package":
             raise ValueError("package initialization is required")
-        from resource_broker import startup_resources
+        from resource_broker import CLIENT, startup_resources
+
+        if CLIENT is not None:
+            from resource_demand import ResourceReads, install_read_audit
+
+            self.reads = ResourceReads(self.downloads, game_profile, CLIENT)
+            self.downloads.mirror.demand = self.reads
+            install_read_audit()
 
         with management_scope(writable=True), startup_resources():
             await self.plugin.start(self.source, PACKAGE)
@@ -69,6 +77,7 @@ class Worker:
         )
         with (
             management_scope(),
+            self.reads.scope() if self.reads is not None else nullcontext(),
             binding_scope(
                 event.get("actor_id"),
                 event.get("adapter_id"),
@@ -145,6 +154,8 @@ async def serve(output):
         from resource_broker import CLIENT
 
         try:
+            if worker.reads is not None:
+                worker.reads.close()
             await worker.downloads.mirror.stop_continuations()
             if worker.plugin:
                 await worker.plugin.stop()

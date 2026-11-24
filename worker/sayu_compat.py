@@ -812,6 +812,10 @@ def get_res_path(_path=None):
     if not root.resolve().is_relative_to(_data_root / "resources"):
         raise ValueError("resource directory outside plugin resources")
     root.mkdir(exist_ok=True, parents=True)
+    if getattr(sys.modules.get("game_profile"), "PUBLIC_RESOURCES_ONLY", False):
+        from resource_demand import ResourcePath
+
+        return ResourcePath(root)
     return root
 
 

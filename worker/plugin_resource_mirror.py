@@ -116,6 +116,7 @@ class Mirror:
         self._probed = False
         self._continuations = {}
         self._runner = None
+        self.demand = None
 
     def diagnostics(self):
         return {
@@ -124,6 +125,7 @@ class Mirror:
             "failures": list(self.failures),
             "omitted_failures": self.omitted_failures,
             "continuations": [b.inventory() for b in self._continuations.values()],
+            "on_demand": self.demand.diagnostics() if self.demand is not None else {},
         }
 
     def _failed(self, stage, url, reason, status=None):
@@ -246,6 +248,8 @@ class Mirror:
         from resource_broker import CLIENT, transfer_window
 
         prefix = "/" + quote(segment(plugin_name)) + "/"
+        if self.demand is not None:
+            self.demand.declare(endpoints, base)
         key = (base, frozenset(endpoints))
         if (
             CLIENT is not None
@@ -400,7 +404,8 @@ class Mirror:
             return
         size = int(length)
         target = self.port._file(folder, name, allow_json=True)
-        if target.is_file() and size and target.stat().st_size == size:
+        existing = target.is_file()
+        if existing and size and target.stat().st_size == size:
             self.counts["unchanged"] += 1
             return
         if size > 8 * 1024 * 1024 or batch.bytes + size > 32 * 1024 * 1024:
@@ -419,15 +424,17 @@ class Mirror:
             await asyncio.to_thread(self.port._image, data)
         # An atomic file publication already in progress must settle before
         # retirement can release the private generation's storage lock.
-        write = asyncio.create_task(self._publish(target, data, batch))
+        write = asyncio.create_task(self._publish(target, data, batch, replace=existing))
         try:
             await asyncio.shield(write)
         except asyncio.CancelledError:
             await write
             raise
 
-    async def _publish(self, target, data, batch):
-        await asyncio.to_thread(self.port._write, target, data)
+    async def _publish(self, target, data, batch, *, replace):
+        if not await asyncio.to_thread(self.port._write, target, data, replace=replace):
+            self.counts["unchanged"] += 1
+            return
         self.bytes_written += len(data)
         self.counts["downloaded"] += 1
         batch.published_files += 1

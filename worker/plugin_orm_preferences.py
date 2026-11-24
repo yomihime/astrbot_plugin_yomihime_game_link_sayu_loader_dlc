@@ -41,10 +41,9 @@ def preference_columns(model, table, base_id):
     return fields
 
 
-async def guard_preferences(driver, access):
+async def guard_physical_table(driver, table, columns):
     # Check the physical database as well as the imported model. Older profiles
     # may carry extra columns or triggers that the current class never declared.
-    table, columns = access.preference
     async with driver.execute(f'PRAGMA main.table_xinfo("{table}")') as cursor:
         rows = await cursor.fetchall()
     if (
@@ -57,17 +56,22 @@ async def guard_preferences(driver, access):
             if r[1] != "id"
         )
     ):
-        raise Unsupported("preference table differs from its declared model")
+        raise Unsupported("owner table differs from its declared model")
     async with driver.execute(
         "SELECT type FROM main.sqlite_master WHERE tbl_name=? COLLATE NOCASE "
         "AND type IN ('table', 'view', 'trigger')",
         (table,),
     ) as cursor:
         if await cursor.fetchall() != [("table",)]:
-            raise Unsupported("preference table has additional database behavior")
+            raise Unsupported("owner table has additional database behavior")
     async with driver.execute(f'PRAGMA main.foreign_key_list("{table}")') as cursor:
         if await cursor.fetchone():
-            raise Unsupported("preference table references another model")
+            raise Unsupported("owner table references another model")
+
+
+async def guard_preferences(driver, access):
+    table, columns = access.preference
+    await guard_physical_table(driver, table, columns)
     async with driver.execute(
         "SELECT 1 FROM pragma_index_list(?) AS idx WHERE idx.[unique] AND NOT idx.partial "
         "AND (SELECT count(*)=1 AND min(name)='user_id' FROM pragma_index_info(idx.name))",

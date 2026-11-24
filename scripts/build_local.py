@@ -91,6 +91,7 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
         f"PUBLIC_RESOURCES_ONLY = {public_resources_only!r}\n"
         f"STATIC_RESOURCE_URLS = {tuple(static_urls)!r}\n"
         f"STATIC_RESOURCE_DIRECTORIES = {tuple(directories)!r}\n"
+        f"SHA256_MANIFEST_DIRECTORY = {policy.get('sha256_manifest_directory')!r}\n"
         f"PUBLIC_IMAGE_ORIGINS = {tuple(policy.get('image_origins', ()))!r}\n"
         f"PUBLIC_BULK_MIRRORS = {tuple(policy.get('bulk_mirrors', ()))!r}\n"
     ).encode("utf-8")

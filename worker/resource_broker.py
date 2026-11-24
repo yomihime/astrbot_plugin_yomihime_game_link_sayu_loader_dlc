@@ -379,6 +379,13 @@ class Reader:
             raise Unsupported("invalid or unauthorized public resource")
         return status, headers, data
 
+    def read_before(self, url, limit, deadline):
+        # The same child enforces the immutable URL, response type and byte policy.
+        try:
+            return self.request(url, limit, deadline, False)
+        except StartupTransferLimit as exc:
+            raise TimeoutError("interactive static read deadline exceeded") from exc
+
 
 @contextmanager
 def activate(archive):

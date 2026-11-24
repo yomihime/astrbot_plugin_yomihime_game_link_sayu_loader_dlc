@@ -25,6 +25,7 @@ from sqlmodel import Field, SQLModel
 
 from port_errors import Unsupported
 import plugin_bindings
+from plugin_orm_bind import BIND_ERROR, guard_bind, permits_bind, uid_columns
 from plugin_orm_preferences import (
     OWNER_ERROR,
     guard_preferences,
@@ -51,6 +52,7 @@ class Access:
     origin: object
     task: object
     preference: tuple[str, frozenset[str]] | None = None
+    binding: tuple[str, frozenset[str]] | None = None
 
     def check(self):
         if self.root is not _runtime or asyncio.current_task() is not self.task:
@@ -161,6 +163,8 @@ class PluginORM:
         self.writer = asyncio.Lock()
         self.writer_task = None
         self.preferences = {}
+        self.bindings = {}
+        self.bind_tables = set()
 
     def path(self, name):
         path = self.root / name
@@ -219,14 +223,23 @@ class PluginORM:
             and isinstance(model, type)
         ):
             preference = self.preferences.get(model)
-        write = not read_only and (owner.writable or preference is not None)
+        binding = None
+        if not owner.writable and isinstance(model, type) and model in self.bindings:
+            binding = self.bindings[model]
+            if not owner.uid_read or binding is None:
+                raise Unsupported(BIND_ERROR)
+        write = not read_only and (
+            owner.writable
+            or preference is not None
+            or (binding is not None and owner.uid_write)
+        )
         if not path.exists():
             template = self.path("empty.sqlite3")
             if write:
                 self.clone_schema(template, path)
             else:
                 path = template
-        return Access(self, path, write, False, owner, task, preference)
+        return Access(self, path, write, False, owner, task, preference, binding)
 
     def publish_empty_schema(self):
         # Plugin startup may seed records in its own store. A new actor inherits
@@ -328,6 +341,17 @@ class PluginORM:
                 allowed = permits(
                     access.preference, action, first, second, database, trigger
                 )
+            if action in _DML or action == sqlite3.SQLITE_READ:
+                if access.binding:
+                    allowed = permits_bind(
+                        access, action, first, second, database, trigger
+                    )
+                elif (
+                    not access.startup
+                    and not access.origin.writable
+                    and (first or "").casefold() in self.bind_tables
+                ):
+                    allowed = False
             if not allowed:
                 rejected.append(action)
             return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
@@ -337,6 +361,8 @@ class PluginORM:
             connection.isolation_level = None
             if access.preference:
                 connection.run_async(lambda driver: guard_preferences(driver, access))
+            if access.binding:
+                connection.run_async(lambda driver: guard_bind(driver, access))
             connection.run_async(lambda driver: driver.set_authorizer(authorize))
 
         @event.listens_for(db.sync_engine, "begin")
@@ -354,6 +380,8 @@ class PluginORM:
         try:
             yield db
         except DBAPIError as exc:
+            if access.binding and str(exc.orig) == BIND_ERROR:
+                raise Unsupported(BIND_ERROR) from exc
             if access.preference and str(exc.orig) == OWNER_ERROR:
                 raise Unsupported(OWNER_ERROR) from exc
             if rejected:
@@ -381,6 +409,7 @@ class PluginORM:
         prefix = (self.plugin + ".", "plugins." + self.plugin + ".")
         models = sys.modules["gsuid_core.utils.database.models"]
         base_id = sys.modules["gsuid_core.utils.database.base_models"].BaseIDModel
+        bind = sys.modules["gsuid_core.utils.database.base_models"].Bind
         tables = {models.Subscribe.__table__, models.CoreUser.__table__}
         todo = list(SQLModel.__subclasses__())
         seen = set()
@@ -396,6 +425,9 @@ class PluginORM:
                 or cls.__module__ in (self.plugin, "plugins." + self.plugin)
             ):
                 tables.add(table)
+                if issubclass(cls, bind):
+                    self.bindings[cls] = uid_columns(table)
+                    self.bind_tables.add(table.name.casefold())
                 columns = preference_columns(cls, table, base_id)
                 if columns:
                     self.preferences[cls] = (table.name, columns)

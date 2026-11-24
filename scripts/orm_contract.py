@@ -90,6 +90,27 @@ async def presentation(models):
     return values
 
 
+async def bind_lifecycle(bind):
+    actor, adapter = "uid-owner", "uid-adapter"
+    first, second = "000000284", "000000285"
+    observations = [await bind.get_uid_by_game(actor, adapter)]
+    for uid in (first, first, second):
+        observations.append(
+            await bind.insert_waves_uid(actor, adapter, uid, lenth_limit=9)
+        )
+    observations.append(await bind.get_uid_list_by_game(actor, adapter))
+    observations.append(await bind.switch_uid_by_game(actor, adapter, second))
+    observations.append(await bind.get_uid_by_game(actor, adapter))
+    observations.append(await bind.delete_uid(actor, adapter, first))
+    observations.append(await bind.delete_uid(actor, adapter, first))
+    observations.append(await bind.delete_uid(actor, adapter, second))
+    observations.append(await bind.get_uid_by_game(actor, adapter))
+    observations.append(
+        await bind.insert_waves_uid(actor, adapter, first, lenth_limit=9)
+    )
+    return observations
+
+
 async def independent_preferences(orm):
     from contextlib import closing
     import sqlite3
@@ -122,6 +143,16 @@ async def independent_preferences(orm):
         locale: str
         token: str
 
+    class LibraryBind(base.Bind, table=True):
+        __module__ = "plugins.Reader.models"
+        uid: str | None = None
+        ebook_uid: str | None = None
+
+    class AccountBind(base.Bind, table=True):
+        __module__ = "plugins.Reader.models"
+        uid: str | None = None
+        cookie: str = ""
+
     with management_scope(writable=True):
         async with orm.startup():
             await orm.migrate()
@@ -129,6 +160,34 @@ async def independent_preferences(orm):
     @base.with_session
     async def add(cls, session, **values):
         session.add(cls(user_id="reader", locale="fr", **values))
+
+    with binding_scope("reader", "local", True, uid_write=True):
+        assert (
+            await LibraryBind.insert_uid("reader", "local", "00102", game_name="ebook")
+            == 0
+        )
+        assert await LibraryBind.get_uid_by_game("reader", "local", "ebook") == "00102"
+        try:
+            await AccountBind.insert_uid("reader", "local", "811")
+        except Unsupported:
+            pass
+        else:
+            raise AssertionError(
+                "a mixed credential model received numeric UID authority"
+            )
+        path = orm.access().path
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("ALTER TABLE librarybind ADD COLUMN legacy_cookie TEXT")
+        try:
+            await LibraryBind.get_uid_by_game("reader", "local", "ebook")
+        except Unsupported as exc:
+            assert "differs from its declared model" in str(exc)
+        else:
+            raise AssertionError("an earlier mixed-purpose table received a UID grant")
+        with closing(sqlite3.connect(path)) as db:
+            assert db.execute("SELECT ebook_uid FROM librarybind").fetchone() == (
+                "00102",
+            )
 
     with binding_scope("reader", "local", True, preferences=True):
         await add(ReaderSettings)
@@ -157,6 +216,7 @@ async def independent_preferences(orm):
             "profile": "Reader",
             "table": ReaderSettings.__tablename__,
             "locale": row.locale,
+            "binding": LibraryBind.__tablename__,
         }
 
 
@@ -177,6 +237,7 @@ async def child(kind, source, worker):
         return {
             "observations": await business(models, base),
             "preferences": await presentation(models),
+            "numeric_uids": await bind_lifecycle(models.WavesBind),
         }
     sys.path.insert(0, str(worker))
     import plugin_bindings
@@ -216,9 +277,17 @@ async def child(kind, source, worker):
         private=True,
         writable=False,
         preferences=False,
+        uid_read=True,
+        uid_write=False,
     ):
         return plugin_bindings.binding_scope(
-            name, adapter, private, writable=writable, preferences=preferences
+            name,
+            adapter,
+            private,
+            writable=writable,
+            preferences=preferences,
+            uid_read=uid_read,
+            uid_write=uid_write,
         )
 
     if kind == "reload":
@@ -227,10 +296,20 @@ async def child(kind, source, worker):
             assert await models.WavesLangSettings.get_lang("actor") == "kr"
             assert (
                 uid == "1205"
-                and first["already_applied"] == 48
+                and first["files"] == 3
+                and first["already_applied"] == 24 * first["files"]
                 and first["applied"] == 0
             )
-        return {"persistent_uid": uid, "migration": first}
+        with actor("uid-owner", adapter="uid-adapter"):
+            assert (
+                await models.WavesBind.get_uid_by_game("uid-owner", "uid-adapter")
+                == "000000284"
+            )
+        return {
+            "persistent_uid": uid,
+            "persistent_numeric_uid": "000000284",
+            "migration": first,
+        }
     with actor(writable=True):
         assert await models.WavesBind.get_binds_by_uid("9393") == []
         observed = await business(models, base)
@@ -262,6 +341,54 @@ async def child(kind, source, worker):
             return True
         raise AssertionError("operation unexpectedly succeeded")
 
+    bind = models.WavesBind
+    with actor("uid-owner", adapter="uid-adapter", uid_write=True):
+        numeric_uids = await bind_lifecycle(bind)
+        assert not plugin_bindings._current.get().writable
+
+        @base.with_session
+        async def raw_sql(cls, session, sql):
+            await session.execute(text(sql))
+
+        for sql in (
+            "UPDATE wavesbind SET uid='１２３'",
+            "UPDATE wavesbind SET uid='01_x'",
+            "UPDATE wavesbind SET pgr_uid='token'",
+            "UPDATE wavesbind SET group_id='group'",
+            "UPDATE wavesbind SET bot_id='other'",
+            "DELETE FROM wavesbind",
+            "INSERT OR REPLACE INTO wavesbind (id,user_id,bot_id,uid) VALUES (1,'uid-owner','uid-adapter','45')",
+            "SELECT cookie FROM wavesuser",
+            "UPDATE subscribe SET uid='45'",
+            "ALTER TABLE wavesbind ADD COLUMN cookie TEXT",
+        ):
+            await must_deny(raw_sql(bind, sql))
+        await must_deny(raw_sql(None, "SELECT uid FROM wavesbind"))
+        await must_deny(bind.get_uid_by_game("other", "uid-adapter"))
+        await must_deny(bind.get_uid_by_game("uid-owner", "other"))
+        await must_deny(
+            asyncio.create_task(bind.get_uid_by_game("uid-owner", "uid-adapter"))
+        )
+        assert await bind.get_uid_by_game("uid-owner", "uid-adapter") == "000000284"
+    with actor("uid-owner", adapter="uid-adapter", uid_read=False, uid_write=True):
+        await must_deny(bind.get_uid_by_game("uid-owner", "uid-adapter"))
+    with actor("uid-owner", adapter="uid-adapter"):
+        await must_deny(bind.delete_uid("uid-owner", "uid-adapter", "000000284"))
+    with actor("uid-owner", adapter="uid-adapter", private=False, uid_write=True):
+        await must_deny(bind.get_uid_by_game("uid-owner", "uid-adapter"))
+    for name, adapter in (("other", "uid-adapter"), ("uid-owner", "other")):
+        with actor(name, adapter=adapter):
+            assert await bind.get_uid_by_game(name, adapter) is None
+    # Reopen rows created with the old administrative grant in their original
+    # file, including an existing group association. Only UID columns may change.
+    with actor(uid_write=True):
+        previous = await bind.select_data("actor", "adapter")
+        assert previous.group_id == "group"
+        assert await bind.insert_waves_uid("actor", "adapter", "000002698") == 0
+        assert await bind.delete_uid("actor", "adapter", "000002698") == 0
+        assert (
+            await bind.select_data("actor", "adapter")
+        ).group_id == previous.group_id
     language = models.WavesLangSettings
     with actor(preferences=True):
         preferences = await presentation(models)
@@ -349,12 +476,13 @@ async def child(kind, source, worker):
                 ).first()
             orm.migrations.pop()
             recovered = await orm.migrate()
-    assert repeated["applied"] == 0 and repeated["files"] == 2
+    assert repeated["applied"] == 0 and repeated["files"] == 3
     with actor():
         assert await models.WavesBind.get_uid_by_game("actor", "adapter") == "1205"
     return {
         "observations": observed,
         "preferences": preferences,
+        "numeric_uids": numeric_uids,
         "owner_checks": len(limits),
         "concurrent_increments": 2,
         "migrations": [first, repeated, failed, recovered],
@@ -435,7 +563,7 @@ def main():
     )
     if not args.child and any(
         report["native"][k] != report["loader"][k]
-        for k in ("observations", "preferences")
+        for k in ("observations", "preferences", "numeric_uids")
     ):
         raise SystemExit("native/loader model results differ")
 

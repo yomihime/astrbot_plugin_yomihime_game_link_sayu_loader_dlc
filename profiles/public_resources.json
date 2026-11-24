@@ -16,6 +16,7 @@
     "bulk_mirrors": []
   },
   "XutheringWavesUID": {
+    "sha256_manifest_directory": "resource/hash",
     "image_origins": [
       "https://prod-alicdn-community.kurobbs.com",
       "https://web-static.kurobbs.com"

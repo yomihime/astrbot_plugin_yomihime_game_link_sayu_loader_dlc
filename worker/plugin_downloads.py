@@ -145,7 +145,7 @@ class Downloads:
         return image
 
     @staticmethod
-    def _write(target, data):
+    def _write(target, data, *, replace=True):
         # Preserve the upstream requirement for an existing destination directory.
         with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
             temp = Path(stream.name)
@@ -156,7 +156,12 @@ class Downloads:
                 temp.unlink(missing_ok=True)
                 raise
         try:
-            os.replace(temp, target)
+            if replace:
+                os.replace(temp, target)
+                return True
+            from worker_storage import publish_new_config
+
+            return publish_new_config(temp, target)
         finally:
             temp.unlink(missing_ok=True)
 
