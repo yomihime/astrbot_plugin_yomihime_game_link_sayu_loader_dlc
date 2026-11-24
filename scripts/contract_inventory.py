@@ -233,6 +233,11 @@ def proof_index():
             "sv.SV.enable",
             "sv.SV.disable",
         ],
+        "sv_routing_contract": [
+            "sv.get_plugin_available_prefix",
+            "sv.get_plugin_prefixs",
+            "trigger.registry_version",
+        ],
         "binding_contract": [
             "utils.database.api.get_uid",
             *(
@@ -300,6 +305,7 @@ PROBE_LIMITS = {
     "core_config_log": "Compared local configuration and logging. Host-wide configuration changes require host authorization.",
     "native": "Two generations of the same self-owned test plugin. Unexercised event shapes remain open.",
     "service": "Compared local service gates and priority. Cross-profile management requires host authorization.",
+    "sv_routing": "Compared prefix resolution, registration snapshots, registry versions and authorized route settings across two generations. Shared cross-plugin dispatch is native-only.",
     "binding": "Compared isolated UID lists and mutations. UID registration does not authenticate a game account.",
     "config": "Compared profile-local configuration loading, types and persistence. Other managers require separate probes.",
     "config_manager": "Compared profile-local config sets, file operations and cache identity. Shared host ACL is separate.",

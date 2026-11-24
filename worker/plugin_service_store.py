@@ -1,6 +1,6 @@
 """Profile-owned GsCore plugin configuration and its mutable public views."""
 
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, MutableSequence
 from contextlib import closing
 import json
 import os
@@ -14,6 +14,84 @@ from port_errors import Unsupported
 
 class RestrictedConfiguration(Unsupported, NotImplementedError):
     """The requested operation is outside the profile's configuration authority."""
+
+
+ROUTING_FIELDS = (
+    "prefix",
+    "force_prefix",
+    "disable_force_prefix",
+    "allow_empty_prefix",
+    "alias",
+)
+_SERVICE_FIELDS = {"enabled", "priority"}
+_PLUGIN_FIELDS = _SERVICE_FIELDS.union(ROUTING_FIELDS)
+
+
+class _TextList(MutableSequence):
+    """List-valued routing settings retain the grant check after a caller keeps a reference."""
+
+    def __init__(self, store, items):
+        self._store = store
+        self._items = self._validated(items)
+
+    @staticmethod
+    def _validated(items):
+        if not isinstance(items, (list, tuple, _TextList)) or not all(
+            isinstance(s, str) for s in items
+        ):
+            raise ValueError("routing options require a list of strings")
+        return list(items)
+
+    def __len__(self):
+        self._store._check_active()
+        return len(self._items)
+
+    def __getitem__(self, index):
+        self._store._check_active()
+        return self._items[index]
+
+    def __setitem__(self, index, value):
+        with self._store.lock:
+            self._store._authorize()
+            if isinstance(index, slice):
+                self._items[index] = self._validated(value)
+            else:
+                self._items[index] = self._validated([value])[0]
+
+    def __delitem__(self, index):
+        with self._store.lock:
+            self._store._authorize()
+            del self._items[index]
+
+    def insert(self, index, value):
+        with self._store.lock:
+            self._store._authorize()
+            self._items.insert(index, self._validated([value])[0])
+
+    def extend(self, values):
+        with self._store.lock:
+            self._store._authorize()
+            self._items.extend(self._validated(values))
+
+    def copy(self):
+        return list(self)
+
+    _snapshot = copy
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def __deepcopy__(self, memo):
+        return self.copy()
+
+    def __eq__(self, other):
+        return self.copy() == (other.copy() if isinstance(other, _TextList) else other)
+
+    def __add__(self, other):
+        return self.copy() + list(other)
+
+    def __radd__(self, other):
+        return list(other) + self.copy()
 
 
 class _StoreInterface:
@@ -49,6 +127,16 @@ class _View(MutableMapping):
         elif path == (self._store.name, "sv"):
             if not isinstance(key, str) or not key:
                 raise ValueError("service name must be a non-empty string")
+        elif len(path) == 1 and key in ROUTING_FIELDS:
+            if key in ("disable_force_prefix", "allow_empty_prefix"):
+                if type(value) is not bool and not (
+                    key == "allow_empty_prefix" and value is None
+                ):
+                    raise ValueError("invalid routing flag")
+                return value
+            if key == "prefix" and isinstance(value, str):
+                return value
+            return _TextList(self._store, value)
         elif key == "enabled":
             if type(value) is not bool:
                 raise ValueError("enabled must be boolean")
@@ -59,7 +147,7 @@ class _View(MutableMapping):
             return value
         elif key != "sv" or len(path) != 1:
             raise RestrictedConfiguration(
-                "only enabled, priority and nested service settings are writable"
+                "field is outside the supported plugin or service configuration"
             )
         return _View(self._store, (*path, key), value)
 
@@ -69,9 +157,7 @@ class _View(MutableMapping):
             self._store._check_plugin(key)
         elif len(self._path) in (1, 3):
             allowed = (
-                {"enabled", "priority", "sv"}
-                if len(self._path) == 1
-                else {"enabled", "priority"}
+                _PLUGIN_FIELDS | {"sv"} if len(self._path) == 1 else _SERVICE_FIELDS
             )
             if key not in allowed:
                 raise RestrictedConfiguration(
@@ -121,7 +207,7 @@ class _View(MutableMapping):
 
     def _snapshot(self):
         return {
-            k: v._snapshot() if isinstance(v, _View) else v
+            k: v._snapshot() if isinstance(v, (_View, _TextList)) else v
             for k, v in self._items.items()
         }
 
@@ -367,8 +453,29 @@ class ProfileServiceStore:
             value = plugin if kind == "plugin" else services.get(name, {})
             target.enabled = value.get("enabled", enabled)
             target.priority = value.get("priority", priority)
+            if kind == "plugin":
+                target._routing = {
+                    key: value.get(key, default)
+                    for key, default in target._routing_defaults.items()
+                }
 
-    def restore(self, kind, target):
+    @staticmethod
+    def _restore_routing(target, node):
+        raw_prefix = node.get("prefix", target._routing_defaults["prefix"])
+        if isinstance(raw_prefix, str):
+            node._items["prefix"] = node._field(
+                "prefix", [raw_prefix] if raw_prefix else []
+            )
+        if "allow_empty_prefix" in node and node["allow_empty_prefix"] is None:
+            node._items["allow_empty_prefix"] = not any(
+                (*node.get("prefix", ()), *node.get("force_prefix", ()))
+            )
+        target._routing = {
+            key: node.get(key, default)
+            for key, default in target._routing_defaults.items()
+        }
+
+    def restore(self, kind, target, *, declared=True):
         with self.lock:
             self._check_active()
             if kind == "plugin":
@@ -377,12 +484,22 @@ class ProfileServiceStore:
             top = self._all._items.setdefault(self.name, _View(self, (self.name,), {}))
             node = top
             if kind == "service":
+                plugin_target = self._targets.get(("plugin", self.name))
+                if plugin_target is not None:
+                    self._restore_routing(plugin_target[0], top)
                 services = top._items.setdefault(
                     "sv", _View(self, (self.name, "sv"), {})
                 )
                 node = services._items.setdefault(
                     target.name, _View(self, (self.name, "sv", target.name), {})
                 )
+            else:
+                for key, default in target._routing_defaults.items():
+                    if key not in node or (
+                        declared and key in ("force_prefix", "alias")
+                    ):
+                        node._items[key] = node._field(key, default)
+                self._restore_routing(target, node)
             for key in ("enabled", "priority"):
                 node._items.setdefault(key, node._field(key, getattr(target, key)))
             self._dirty = True
@@ -396,9 +513,10 @@ class ProfileServiceStore:
                 raise RestrictedConfiguration(
                     "service does not belong to the active profile"
                 )
-            if changes.keys() - {"enabled", "priority"}:
+            allowed = _PLUGIN_FIELDS if kind == "plugin" else _SERVICE_FIELDS
+            if changes.keys() - allowed:
                 raise RestrictedConfiguration(
-                    "only private activation and priority can be changed"
+                    "field is outside the supported plugin or service configuration"
                 )
             top = self._all.setdefault(self.name, {})
             node = (

@@ -35,6 +35,7 @@ from plugin_messages import (
     MessageSend,
 )
 from service_settings import select_service_profile
+from plugin_service_store import ROUTING_FIELDS
 from plugin_app_life import install_app_life
 from plugin_ai import install_ai
 from plugin_qrlogin import install_qrlogin
@@ -190,7 +191,7 @@ class SV:
             _service_store.restore("service", self)
             _services[name] = self
             self.plugins = _plugin_settings.get(_plugin) or Plugins(
-                _plugin, force_prefix=[_prefix] if _prefix else []
+                _plugin, force_prefix=[_prefix] if _prefix else [], _implicit=True
             )
             sys.modules["gsuid_core.sv"].SL.detail_lst.setdefault(
                 self.plugins, []
@@ -227,11 +228,11 @@ class SV:
             if _service_store is None and (not self.enabled or self._acl_blocked):
                 raise Unsupported("restricted service")
             words = (commands,) if isinstance(commands, str) else commands
+            settings = _plugin_settings.get(_plugin)
+            prefixes = settings.prefixes if settings else (_prefix,)
             for word in dict.fromkeys(words):
                 if not isinstance(word, str) or not word:
                     raise ValueError("invalid trigger keyword")
-                settings = _plugin_settings.get(_plugin)
-                prefixes = settings.prefixes if settings else (_prefix,)
                 prefixed = (
                     prefix and prefixes and mode not in {"message", "meta", "file"}
                 )
@@ -242,13 +243,13 @@ class SV:
                     route.ai_description = to_ai
                     route.covers = covers
                     route.aliases = aliases
-                    plugin_trigger.bump_registry_version()
                     table = self.TL.setdefault(mode, {})
                     key = literal_prefix + word
                     if key in table:
                         _routes.remove(table[key])
                     table[key] = route
                     _routes.append(route)
+                plugin_trigger.bump_registry_version()
             return handler
 
         return decorate
@@ -284,6 +285,31 @@ class SV:
 
 
 class Plugins:
+    def __getattr__(self, key):
+        if key in ROUTING_FIELDS:
+            value = self._routing[key]
+            return list(value) if isinstance(value, tuple) else value
+        raise AttributeError(key)
+
+    def __setattr__(self, key, value):
+        if key in ROUTING_FIELDS:
+            self.set(**{key: value})
+        else:
+            object.__setattr__(self, key, value)
+
+    @property
+    def prefixes(self):
+        # The pinned decorator expands these fields once per registration.
+        # A string assigned by Plugins.set remains a string until reload.
+        values = deepcopy(self.prefix)
+        if "" in values:
+            values.remove("")
+        if not self.disable_force_prefix:
+            values.extend(self.force_prefix)
+        if self.allow_empty_prefix:
+            values.append("")
+        return tuple(dict.fromkeys(values))
+
     def __new__(cls, name="", *args, **kwargs):
         if name is None:
             raise ValueError("Plugins.name is None!")
@@ -325,6 +351,7 @@ class Plugins:
         allow_empty_prefix=None,
         force=False,
         alias=(),
+        _implicit=False,
         **options,
     ):
         if name != _plugin or options:
@@ -336,20 +363,25 @@ class Plugins:
         self.pm = pm
         self.priority = priority
         self.enabled = enabled
-        self.prefix = [prefix] if isinstance(prefix, str) else list(prefix)
-        self.force_prefix = list(force_prefix)
-        self.disable_force_prefix = disable_force_prefix
-        self.alias = list(alias)
+        prefix = (prefix,) if isinstance(prefix, str) else tuple(prefix)
+        force_prefix = tuple(force_prefix)
+        self._routing_defaults = {
+            "prefix": prefix,
+            "force_prefix": force_prefix,
+            "disable_force_prefix": disable_force_prefix,
+            "allow_empty_prefix": (
+                not any((*prefix, *force_prefix))
+                if allow_empty_prefix is None
+                else allow_empty_prefix
+            ),
+            "alias": tuple(alias),
+        }
+        self._routing = self._routing_defaults.copy()
         self.sv = {}
         self.white_list, self.black_list = list(white_list), list(black_list)
         self.bot_white_list, self.bot_black_list = (
             list(bot_white_list),
             list(bot_black_list),
-        )
-        self.allow_empty_prefix = (
-            not any((*self.prefix, *self.force_prefix))
-            if allow_empty_prefix is None
-            else allow_empty_prefix
         )
         self._restrictions = {
             "pm": pm,
@@ -362,14 +394,8 @@ class Plugins:
         self._acl_blocked = bool(
             black_list or white_list or bot_black_list or bot_white_list
         )
-        prefixes = [p for p in self.prefix if p]
-        if not disable_force_prefix:
-            prefixes.extend(self.force_prefix)
-        self.prefixes = tuple(dict.fromkeys(prefixes))
-        if self.allow_empty_prefix and "" not in self.prefixes:
-            self.prefixes += ("",)
         if _service_store is not None:
-            _service_store.restore("plugin", self)
+            _service_store.restore("plugin", self, declared=not _implicit)
         _plugin_settings[name] = self
         self._initialized = True
 

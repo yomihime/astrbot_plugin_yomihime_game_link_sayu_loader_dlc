@@ -198,8 +198,11 @@ SQLite 实际执行的指令解释了首个保存点的差异。原生默认连�
 | 当前插件和 SV 的 `enabled`、`priority` | 注册对象、`gsuid_core.sv.config_plugins`、`plugin_config_store` 共用本代际的服务状态。`Plugins.set`、`SV.set` 和 `SV.enable/disable` 立即改变分发状态，默认标脏，`is_lazy=False` 则提交本 profile 的 `services.sqlite3`。既有库中的开关及优先级可恢复。 |
 | `plugin_config_store.get/get_all/set/mark_dirty/save/save_dirty/save_all` | `get` 与 `get_all` 返回同一受控映射，嵌套 `sv` 也保留引用。授权范围内的直接修改更新内存，`set` 还会标脏。`save`、`save_all` 立即提交，`save_dirty` 和框架 `lazy_write_config` 只提交脏项。可信的包扫描完成后保存当前状态。 |
 | 旧 profile 数据 | 当前 profile 下 `plugins_configs/<当前插件>.json` 优先于旧 `config.json["plugins"]`，已持久化的 Loader 设置优先。Loader 将接受的字段写入 SQLite，保留原逐插件文件；旧总配置在 SQLite 提交后备份并移除旧键，其他框架键保留。旧键含外部插件或含不支持的字段时，迁移显式报错并保留源数据。 |
-| 前缀、别名、作用范围 | Loader 可读取注册时声明的字段。当前服务设置写接口仅接受开关和优先级。路由元数据的动态更新属于 Loader 的路由能力，须同时更新实际分发状态。 |
+| 插件前缀和别名 | 当前 profile 的有效管理域可通过 `Plugins.set` 修改 `prefix`、`force_prefix`、`disable_force_prefix`、`allow_empty_prefix` 和 `alias`。前缀帮助函数立即反映变化；已经注册的触发器继续使用各自的前缀，随后注册的触发器使用新配置。重载会重新注册触发器，显式插件声明重新提供强制前缀和插件别名。插件别名用于管理名称解析。装饰器的 `aliases` 是 AI 工具元数据。 |
+| 服务优先级及动态字段 | `SV.set(priority=…)` 在下一条消息的排序中生效。原生双插件竞争验证了 `Plugins.priority` 对命令处理顺序没有影响。固定原生允许向 SV 添加任意属性，例如 `SV.set(prefix=…)` 写入后并不影响该 SV 的命令前缀。Loader 对 SV 继续只接受 `enabled` 和 `priority`，其他写操作返回受限错误。 |
 | 权限和名单 | 隔离适配器可用可信事件身份执行声明的 `pm`、用户/群及 bot 名单。正式入口想按真实角色、群成员或 bot 身份匹配，需要宿主提供相应的可信字段。运行时修改访问策略还需要可信管理授权，未授权回调不能通过配置字典提升权限。 |
+
+`scripts/sv_routing_contract.py --reference .sayu-local/reference --output <私有回执>` 独立运行原生和打包 Worker 各两代。复核指定 Worker 时可加 `--worker <归档>`。断言覆盖已有和新增触发器、裸词、禁用强制前缀、字符串前缀、延迟写与显式保存、重载后的声明优先级，以及同文竞争。YGL 的普通 query/direct 将用户输入作为文本交给这个匹配流程。发布新的宿主顶层命令、接收受信管理员身份属于宿主契约。本 profile 的设置不能更改宿主命令表或为普通聊天授予管理权。
 
 Loader 把同名配置注册表限定在当前 profile，普通事件只能读取值。配置集复制、删除、迁移及缓存清除需要有效管理授权。目录外路径、硬链接文件和目录递归删除被拒绝。独立测试还验证了 20 个竞争复制请求只发布一份完整文件，以及复制或迁移在发布前失败时保留源文件。
 
