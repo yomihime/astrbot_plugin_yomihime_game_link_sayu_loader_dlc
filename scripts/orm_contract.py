@@ -230,19 +230,19 @@ async def account_selection(*, native=False):
     await GsUser.update_data_by_uid_without_bot_id(device_role, "gs", device_id=None)
     renewed = await mys_api.get_user_device_id(device_role, "gs")
     assert UUID(renewed).version == 4 and renewed != first_device
-    missing = await mys_api.get_user_device_id("100009999", "gs")
-    if native:
-        assert UUID(missing).version == 4
-    else:
-        assert missing is None
-    assert await GsUser.select_data_by_uid("100009999", "gs") is None
+    absent_uid = "100009999"
+    missing = await mys_api.get_user_device_id(absent_uid, "gs")
+    repeated = await mys_api.get_user_device_id(absent_uid, "gs")
+    assert UUID(missing).version == UUID(repeated).version == 4 and missing != repeated
+    assert await GsUser.select_data_by_uid(absent_uid, "gs") is None
+    assert await mys_api.get_ck(absent_uid, "OWNER", "gs") is None
     return {
         "same": {
             "aliases_and_fields": checks,
             "status": inactive,
             "device_generated_stored_reused_renewed": True,
         },
-        "absent_device_row": "transient_uuid" if native else "no_device",
+        "absent_device_row": "transient_uuid",
         "unknown_role": unknown,
         "absent_role": absent_role,
     }
@@ -644,6 +644,7 @@ async def child(kind, source, worker):
         )
 
     if kind == "reload":
+        from gsuid_core.utils.api.mys.api import DAILY_NOTE
         from gsuid_core.utils.api.mys_api import mys_api
 
         with actor():
@@ -687,7 +688,18 @@ async def child(kind, source, worker):
                 assert await mys_api.get_ck("100009001", "RANDOM", "gs") is None
                 assert await mys_api.get_stoken("100009001", "gs") is None
                 assert await mys_api.get_user_fp("100009001", "gs") is None
-                assert await mys_api.get_user_device_id("100009001", "gs") is None
+                isolated_device = await mys_api.get_user_device_id("100009001", "gs")
+                assert UUID(isolated_device).version == 4
+                assert isolated_device != "fixture-device-primary"
+                assert await GsUser.select_data_by_uid("100009001", "gs") is None
+                result = await mys_api.endpoint_request(
+                    DAILY_NOTE,
+                    "100009001",
+                    params={"role_id": "100009001"},
+                    header={"x-rpc-device_id": isolated_device},
+                    ds_mode="none",
+                )
+                assert result == -51
         return {
             "persistent_uid": uid,
             "persistent_numeric_uid": "000000284",

@@ -337,7 +337,9 @@ class BaseMysApi:
             users = models.GsUser
             row = await users.select_data_by_uid(canonical, game_name)
             if row is None:
-                return None
+                # Native returns a fresh UUID even when its UPDATE matched zero
+                # rows. This identifier does not enroll a role or authorize GET.
+                return self.get_device_id()
             if row.device_id is not None:
                 return row.device_id
             from plugin_account_devices import initialize_device
