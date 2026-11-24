@@ -13,6 +13,7 @@ from sayu_compat import package
 import plugin_bindings
 import plugin_errors
 from plugin_mys import install_mys
+from plugin_enumeration import install_enumeration
 from plugin_sign import install_sign
 from plugin_gss import install_gss
 from plugin_meta import install_meta, read_meta_plugin_info
@@ -105,6 +106,7 @@ class PluginRuntime:
 
         plugin_bindings.install(package, self.data)
         install_mys(package)
+        self.enumeration = install_enumeration(sys.modules["gsuid_core.utils.database.models"])
         install_sign(package)
         install_cache(package)
         install_backup(package, self.data, plugin)

@@ -40,7 +40,7 @@ def _scaled_size(size, scale):
     return tuple(max(1, int(length * scale)) for length in size)
 
 
-def _decode(encoded, remaining_pixels=MAX_INPUT_PIXELS):
+def _decode(encoded, remaining_pixels=MAX_INPUT_PIXELS, *, single_budget=None):
     if not isinstance(encoded, str) or len(encoded) > 4 * (
         (MAX_INPUT_IMAGE_BYTES + 2) // 3
     ):
@@ -50,8 +50,14 @@ def _decode(encoded, remaining_pixels=MAX_INPUT_PIXELS):
         if len(raw) > MAX_INPUT_IMAGE_BYTES:
             raise UnsupportedMessage("image exceeds source byte limit")
         with Image.open(BytesIO(raw), formats=("JPEG", "PNG")) as image:
-            if not 0 < image.width * image.height <= remaining_pixels:
-                raise UnsupportedMessage("image exceeds source pixel limit")
+            if image.width * image.height > remaining_pixels:
+                from rendered_images import generated
+
+                if single_budget is None or not generated(raw, image.size):
+                    raise UnsupportedMessage("image exceeds source pixel limit")
+                # Check recipient readability against the original dimensions
+                # before allocating or resampling an authenticated local canvas.
+                _fit_scale(*image.size, *single_budget)
             if getattr(image, "is_animated", False):
                 raise UnsupportedMessage("animated images cannot be projected")
             has_alpha = "A" in image.getbands() or "transparency" in image.info
@@ -106,7 +112,11 @@ def prepare_public_parts(parts, source, package):
             continue
         if part.keys() != {"image"}:
             raise UnsupportedMessage("unknown public message part")
-        image, byte_count = _decode(part["image"], remaining_pixels)
+        image, byte_count = _decode(
+            part["image"],
+            remaining_pixels,
+            single_budget=(PUBLIC_SIDE, PUBLIC_SIDE, PUBLIC_PIXELS),
+        )
         remaining_pixels -= image.width * image.height
         scale = _fit_scale(*image.size, PUBLIC_SIDE, PUBLIC_SIDE, PUBLIC_PIXELS)
         if scale == 1.0 and byte_count <= PUBLIC_BYTES:
@@ -160,7 +170,13 @@ def _compose(parts, source, package, *, public):
     total_text = 0
     for part in parts:
         if isinstance(part, dict) and part.keys() == {"image"}:
-            image, _ = _decode(part["image"], MAX_INPUT_PIXELS - pixel_count)
+            image, _ = _decode(
+                part["image"],
+                MAX_INPUT_PIXELS - pixel_count,
+                single_budget=(MAX_WIDTH, MAX_HEIGHT, MAX_PIXELS)
+                if len(parts) == 1
+                else None,
+            )
             pixel_count += image.width * image.height
             width = max(width, image.width)
             content.append(image)

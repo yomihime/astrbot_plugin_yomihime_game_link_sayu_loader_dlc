@@ -148,6 +148,21 @@ def proof_index():
             "utils.api.mys.base_request.BaseMysApi.get_server_id",
             "utils.api.mys.api.ApiEndpoint.get",
         ],
+        "account_enumeration_contract": [
+            "utils.database.base_models." + name
+            for name in (
+                "BaseBotIDModel.get_all_data",
+                "Bind.get_all_uid_list_by_game",
+                "User.get_all_user",
+                "User.get_all_cookie",
+                "User.get_all_stoken",
+                "User.get_all_error_cookie",
+                "User.get_all_push_user_list",
+                "User.get_all_sign_user_list",
+                "User.get_push_user_list",
+                "User.get_sign_user_list",
+            )
+        ],
         "mys_cache_contract": ["utils.cache.gs_cache"],
         "mys_models_contract": ["utils.api.mys.models"],
         "subscribe_contract": ["subscribe.GsCoreSubscribe"],

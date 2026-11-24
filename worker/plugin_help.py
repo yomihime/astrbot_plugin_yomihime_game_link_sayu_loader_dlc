@@ -145,21 +145,55 @@ def _port(modern):
             raise Unsupported("invalid help column count")
         if modern and not 0 < params["plugin_icon_size"] <= 2048:
             raise Unsupported("invalid help icon dimensions")
+        from sayu_compat import MAX_INPUT_PIXELS
+
+        if modern:
+            # The modern renderer converts every supplied decoration to RGBA
+            # together. Keep those external inputs within one source budget.
+            decorations = [
+                params[k]
+                for k in (
+                    "plugin_icon",
+                    "banner_bg",
+                    "help_bg",
+                    "item_bg",
+                    "footer",
+                    "highlight_bg",
+                )
+            ]
+            groups = owner._unwrap_cag_bg(params["cag_bg"])
+            decorations.extend(
+                groups if isinstance(groups, (tuple, list)) else (groups,)
+            )
+            if (
+                sum(
+                    im.width * im.height
+                    for im in decorations
+                    if isinstance(im, Image.Image)
+                )
+                > MAX_INPUT_PIXELS
+            ):
+                raise Unsupported("help decorations exceed the source pixel limit")
         icon_path = params["icon_path" if modern else "ICON_PATH"]
         if icon_path is not None:
             _safe_image(icon_path)
         help_data = params["plugin_help" if modern else "help_data"]
         for group in help_data.values():
             for entry in group["data"]:
-                if "icon" in entry and not isinstance(entry["icon"], Image.Image):
-                    _safe_image(entry["icon"])
+                if "icon" in entry:
+                    icon = entry["icon"]
+                    if isinstance(icon, Image.Image):
+                        if icon.width * icon.height > MAX_INPUT_PIXELS:
+                            raise Unsupported(
+                                "help icon exceeds the source pixel limit"
+                            )
+                    else:
+                        _safe_image(icon)
                 if not modern:
                     _filename(entry["name"])
         if not modern:
             # The classic renderer allocates one transparent canvas per group
             # before calling the common bounded crop helper.
-            from sayu_compat import MAX_INPUT_PIXELS
-
             width = 50 + 260 * column
             height = 630 + (100 if params["extra_message"] else 0)
             for group in help_data.values():
@@ -172,7 +206,10 @@ def _port(modern):
 
 
 def install_help(package, data_root, *, source_root=None):
+    from rendered_images import clear_generated
+
     global _assets
+    clear_generated()
     _assets = _Assets(data_root, source_root)
     _renderer.cache_clear()
     for suffix in ("draw_new_plugin_help", "draw_plugin_help", "image_helpers"):

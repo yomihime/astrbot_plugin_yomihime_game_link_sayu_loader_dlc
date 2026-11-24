@@ -72,8 +72,15 @@ def _response(url):
 
 
 def crop_center_img(img, based_w, based_h):
+    from sayu_compat import MAX_INPUT_PIXELS
+
+    return _crop_center_img(img, based_w, based_h, MAX_INPUT_PIXELS, MAX_INPUT_PIXELS)
+
+
+def _crop_center_img(img, based_w, based_h, canvas_limit, resize_limit):
     _pixels(img.size)
-    _pixels((based_w, based_h))
+    if based_w * based_h > canvas_limit:
+        raise Unsupported("image dimensions exceed the canvas limit")
     # Native compares two *formatted strings*, then calculates both sizes
     # with the rounded source ratio. Numeric aspect comparison differs at 10:1.
     target_ratio = f"{based_w / based_h:.3f}"
@@ -81,11 +88,22 @@ def crop_center_img(img, based_w, based_h):
     width = math.ceil(based_h * float(source_ratio))
     height = math.ceil(based_w / float(source_ratio))
     size = (width, based_h) if source_ratio > target_ratio else (based_w, height)
-    _pixels(size)
-    resized = img.resize(size, Image.Resampling.LANCZOS)
+    if size[0] * size[1] > resize_limit:
+        raise Unsupported("intermediate resize exceeds the canvas limit")
     left = (size[0] - based_w) / 2
     top = (size[1] - based_h) / 2
-    return resized.crop((int(left), int(top), int(left + based_w), int(top + based_h)))
+    with img.resize(size, Image.Resampling.LANCZOS) as resized:
+        return resized.crop(
+            (int(left), int(top), int(left + based_w), int(top + based_h))
+        )
+
+
+def _background_color(image, is_light):
+    with image.quantize(colors=8, method=Image.Quantize.FASTOCTREE) as quantized:
+        palette = quantized.getpalette()
+    colors = (tuple(palette[i : i + 3]) for i in range(0, 24, 3))
+    target = 195 if is_light else 120
+    return min(colors, key=lambda c: abs(c[0] * 0.3 + c[1] * 0.6 + c[2] * 0.1 - target))
 
 
 def easy_alpha_composite(im, im_paste, pos=(0, 0), direction="lt"):
@@ -171,14 +189,7 @@ class CustomizeImage:
     @staticmethod
     def get_bg_color(edit_bg, is_light=False):
         _pixels(edit_bg.size)
-        palette = edit_bg.quantize(
-            colors=8, method=Image.Quantize.FASTOCTREE
-        ).getpalette()
-        colors = (tuple(palette[i : i + 3]) for i in range(0, 24, 3))
-        target = 195 if is_light else 120
-        return min(
-            colors, key=lambda c: abs(c[0] * 0.3 + c[1] * 0.6 + c[2] * 0.1 - target)
-        )
+        return _background_color(edit_bg, is_light)
 
     @staticmethod
     def get_text_color(bg_color):

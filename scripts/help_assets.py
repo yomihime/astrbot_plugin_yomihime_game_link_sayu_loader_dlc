@@ -90,6 +90,28 @@ def verified_help(reference=None):
         )
         src = src.replace('pic_gen_config.get_config("PicQuality").data', "85")
         src = src.replace("Path(__file__).parent", "asset_root()")
+        if filename == MODERN:
+            # Only the fixed renderer can issue canvas outputs; untrusted asset
+            # inputs and all other SDK callers retain the ordinary image limit.
+            src = src.replace(
+                "from gsuid_core.utils.image.convert import convert_img_sync",
+                "from rendered_images import (crop_canvas as crop_center_img, "
+                "encode_canvas as convert_img_sync, serialized_render, open_cached_canvas, "
+                "save_canvas, resize_decoration, canvas_color)",
+            ).replace("    crop_center_img,\n", "")
+            src = src.replace("CustomizeImage.get_bg_color(", "canvas_color(")
+            src = src.replace(
+                "@to_thread\ndef _get_new_help(",
+                "@to_thread\n@serialized_render\ndef _get_new_help(",
+            )
+            src = src.replace("Image.open(help_path)", "open_cached_canvas(help_path)")
+            src = src.replace(
+                "img.save(\n        help_path,", "save_canvas(img,\n        help_path,"
+            )
+            for surface in ("banner_bg", "cag_bar"):
+                src = src.replace(
+                    f"{surface}.resize((w,", f"resize_decoration({surface}, (w,"
+                )
         src = src.replace("Image.open(", "open_help_image(")
         result["plugin_help_native/" + Path(filename).name] = (NOTICE + src).encode()
     src = inputs[IMAGE_TOOLS].decode()

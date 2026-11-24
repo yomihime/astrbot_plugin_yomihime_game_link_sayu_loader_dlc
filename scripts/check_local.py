@@ -65,6 +65,12 @@ async def check(core, cases, list_commands=False):
             for key, binding in runtime.WORKERS.items()
         }
         manifests = {m.route: m for m in manifest.modules}
+        # An opaque upstream callback can update its private profile. A host
+        # must never offer these routes as read-only tools or public Web previews.
+        for game in manifests.values():
+            for capability in game.capabilities:
+                assert capability.effect.value == "write"
+                assert capability.invocation_policy.value == "command_only"
         modules = {}
         handlers = {}
 
