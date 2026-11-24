@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 from PIL import Image, UnidentifiedImageError
 
 from port_errors import Unsupported
-from plugin_resource_mirror import Mirror, segment
+from plugin_resource_mirror import Mirror, segment, settle_thread
 
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MAX_BYTES = 8 * 1024 * 1024
@@ -112,7 +112,7 @@ class Downloads:
         from plugin_public_http import read_public_https
 
         if self.transport is None:
-            code, _, body = await asyncio.to_thread(
+            code, _, body = await settle_thread(
                 read_public_https, url, limit, accept="*/*", skip_error_body=True
             )
             return code, body

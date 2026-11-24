@@ -3,7 +3,7 @@
 import http.client
 import ipaddress
 from functools import lru_cache
-from threading import Lock
+from threading import Condition, Lock
 from pathlib import Path
 import re
 import socket
@@ -95,6 +95,120 @@ class _IdleConnections:
 
 
 _mirror_connections = _IdleConnections()
+
+
+class StreamControl:
+    def __init__(self):
+        self.lock = Condition()
+        self.stopped = False
+        self.sock = None
+        self.credit = 8
+
+    def take_credit(self, deadline):
+        with self.lock:
+            if not self.lock.wait_for(
+                lambda: self.credit or self.stopped, max(0, deadline - monotonic())
+            ):
+                raise TimeoutError("unconsumed public stream")
+            if self.stopped:
+                raise InterruptedError("public stream retired")
+            self.credit -= 1
+
+    def acknowledge(self):
+        with self.lock:
+            self.credit = min(8, self.credit + 4)
+            self.lock.notify_all()
+
+    def bind(self, sock):
+        with self.lock:
+            if self.stopped:
+                raise InterruptedError("public stream closed")
+            self.sock = sock
+
+    def cancel(self):
+        with self.lock:
+            self.stopped = True
+            self.lock.notify_all()
+            if self.sock is not None:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+def stream_public_https(url, mime, size, deadline, control, emit):
+    """Read a previously authorized, exact-size object on a new checked connection."""
+
+    def remaining(timeout):
+        if control.stopped:
+            raise InterruptedError("public stream closed")
+        left = deadline - monotonic()
+        if left <= 0:
+            raise TimeoutError("public stream deadline exceeded")
+        return min(left, timeout)
+
+    target = urlsplit(url)
+    if (
+        target.scheme != "https"
+        or target.netloc != target.hostname
+        or target.query
+        or target.fragment
+    ):
+        raise Unsupported("invalid public stream target")
+    remaining(8)
+    addresses = socket.getaddrinfo(target.hostname, 443, type=socket.SOCK_STREAM)
+    peers = [ipaddress.ip_address(row[4][0]) for row in addresses]
+    if not peers or any(not peer.is_global or peer.is_multicast for peer in peers):
+        raise Unsupported("public stream requires a public address")
+    conn = _open_checked(target.hostname, addresses, remaining)
+    try:
+        sock = conn.sock
+        control.bind(sock)
+        if ipaddress.ip_address(sock.getpeername()[0]) not in peers:
+            raise Unsupported("unexpected public stream peer")
+        sock.settimeout(remaining(8))
+        conn.request(
+            "GET", target.path, headers={"Accept": "*/*", "Accept-Encoding": "identity"}
+        )
+        with conn.getresponse() as response:
+            # Expose actual representation metadata. No Location, Set-Cookie,
+            # authentication challenge or other stateful header crosses the pipe.
+            headers = [
+                (k, v)
+                for k, v in response.getheaders()
+                if k.lower()
+                in {"content-type", "content-length", "last-modified", "etag", "date"}
+            ]
+            if sum(len(k) + len(v) for k, v in headers) > 2048:
+                raise Unsupported("public stream headers exceed limit")
+            if response.status != 200:
+                emit(
+                    response.status,
+                    [(k, v) for k, v in headers if k.lower() != "content-length"],
+                    b"",
+                )
+                return
+            if (
+                response.getheader("Content-Type", "").partition(";")[0].strip().lower()
+                != mime
+                or response.getheader("Content-Length") != str(size)
+                or response.getheader("Content-Encoding", "identity").lower()
+                != "identity"
+                or response.getheader("Transfer-Encoding") is not None
+            ):
+                raise Unsupported("public stream metadata differs from declaration")
+            emit(response.status, headers, b"")
+            total = 0
+            while total < size:
+                control.take_credit(deadline)
+                sock.settimeout(remaining(8))
+                chunk = response.read1(min(65536, size - total))
+                if not chunk:
+                    raise http.client.IncompleteRead(b"", size - total)
+                total += len(chunk)
+                emit("chunk", [], chunk)
+    finally:
+        conn.close()
 
 
 def _open_checked(host, addresses, remaining):

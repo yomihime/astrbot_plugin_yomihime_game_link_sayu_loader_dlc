@@ -15,6 +15,7 @@ from game_profile import OFFLINE, OWNER_WRITES, PACKAGE, PREFIX, RUNTIME_MODE
 from images import prepare_owner_parts, prepare_public_parts
 from plugin_runtime import PluginRuntime
 from plugin_bindings import binding_scope
+from resource_httpx import stream_scope
 from service_settings import management_scope
 from worker_storage import install_write_guard
 
@@ -77,6 +78,7 @@ class Worker:
         )
         with (
             management_scope(),
+            stream_scope(),
             self.reads.scope() if self.reads is not None else nullcontext(),
             binding_scope(
                 event.get("actor_id"),
@@ -138,7 +140,8 @@ async def serve(output):
         },
     )
     try:
-        worker.downloads.mirror.start_continuations()
+        if worker.reads is not None:
+            worker.reads.start()
         while True:
             line = await asyncio.to_thread(sys.stdin.buffer.readline, 16385)
             if not line:
@@ -156,12 +159,13 @@ async def serve(output):
         try:
             if worker.reads is not None:
                 worker.reads.close()
-            await worker.downloads.mirror.stop_continuations()
             if worker.plugin:
                 await worker.plugin.stop()
         finally:
             if CLIENT is not None:
                 CLIENT.close()
+            if worker.reads is not None:
+                await asyncio.to_thread(worker.reads.join)
 
 
 class ProfileBusy(RuntimeError):

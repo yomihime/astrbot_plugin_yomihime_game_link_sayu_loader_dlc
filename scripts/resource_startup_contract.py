@@ -78,7 +78,8 @@ async def exercise(core, serial, observe_seconds=0):
                 "download_counts": inventory["downloads"]["counts"],
                 "downloaded_bytes": inventory["downloads"]["bytes_written"],
                 "on_demand": inventory["downloads"]["on_demand"],
-                "continuations_at_ready": inventory["downloads"]["continuations"],
+                "terminal_batches": inventory["downloads"]["batches"],
+                "startup_outcomes": inventory["downloads"]["startup_outcomes"],
             }
 
         async def stop(key, module):
@@ -108,12 +109,11 @@ async def exercise(core, serial, observe_seconds=0):
                 await asyncio.sleep(observe_seconds)
                 for key, module in instances.items():
                     inventory = await module.exchange({"op": "inventory"})
-                    rows[key]["continuations_after_ready"] = inventory["downloads"][
-                        "continuations"
-                    ]
-                    rows[key]["bytes_after_ready"] = inventory["downloads"][
-                        "bytes_written"
-                    ]
+                    downloads = inventory["downloads"]
+                    rows[key]["batches_after_ready"] = downloads["batches"]
+                    rows[key]["bytes_after_ready"] = downloads["bytes_written"]
+                    assert rows[key]["terminal_batches"] == downloads["batches"]
+                    assert rows[key]["downloaded_bytes"] == downloads["bytes_written"]
         finally:
             async with asyncio.timeout(5):
                 await asyncio.gather(*(stop(k, m) for k, m in instances.items()))

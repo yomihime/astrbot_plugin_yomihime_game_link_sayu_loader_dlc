@@ -99,6 +99,12 @@ class ResourceReads:
         self.closed = False
         self.serial = Lock()
         self.publication = Lock()
+        self.metadata_lock = Lock()
+        self.metadata_pool = None
+        self.metadata_jobs = {}
+        self.reported_failures = set()
+        self.warmed = set()
+        self.ready = False
 
     def declare(self, endpoints, base):
         for route, folder in endpoints:
@@ -113,6 +119,28 @@ class ResourceReads:
                 self.folders[folder] = ("", "")  # Ambiguous mappings fail closed.
             elif prior or len(self.folders) < 128:
                 self.folders[folder] = (route, base)
+        if self.ready:
+            self.warm_declared()
+
+    def start(self):
+        self.ready = True
+        self.warm_declared()
+
+    def warm_declared(self):
+        if not self.ready or not self.hash_route:
+            return
+        for route, explicit in self.folders.values():
+            if route != self.hash_route:
+                continue
+            origin = explicit or self.port.mirror._selected
+            if not origin:
+                continue
+            directory = origin + self.namespace + route + "/"
+            with self.metadata_lock:
+                if self.closed or directory in self.warmed or len(self.warmed) >= 2:
+                    continue
+                self.warmed.add(directory)
+                self._metadata_job(directory)
 
     @contextmanager
     def scope(self):
@@ -128,9 +156,34 @@ class ResourceReads:
     def close(self):
         with self.publication:
             self.closed = True
+        with self.metadata_lock:
+            if self.metadata_pool is not None:
+                self.metadata_pool.shutdown(wait=False, cancel_futures=True)
+
+    def join(self):
+        # Called after the broker's input closes and releases any TLS waiters.
+        if self.metadata_pool is not None:
+            self.metadata_pool.shutdown(wait=True, cancel_futures=True)
 
     def diagnostics(self):
-        return {"declared_folders": len(self.folders), "counts": dict(self.counts)}
+        with self.metadata_lock:
+            loads = []
+            for directory, future in self.metadata_jobs.items():
+                if future.cancelled() or self.closed:
+                    state = "retired"
+                elif not future.done():
+                    state = "loading"
+                else:
+                    failure = future.exception()
+                    state = (
+                        type(failure).__name__ if failure is not None else "verified"
+                    )
+                loads.append({"origin": directory.split("/")[2], "state": state})
+            return {
+                "declared_folders": len(self.folders),
+                "counts": dict(self.counts),
+                "checksum_sets": loads,
+            }
 
     def ensure(self, lease, value):
         # Strip the derived Path type before local checks to avoid recursive probes.
@@ -157,15 +210,18 @@ class ResourceReads:
             lease.end = monotonic() + 12
         if not self.serial.acquire(timeout=max(0.0, lease.end - monotonic())):
             self.counts["read_budget"] += 1
-            return False
+            raise TimeoutError("static read queue deadline exceeded")
         try:
             if target.is_file():
                 return True
             if self.closed or not lease.active or target in lease.missed:
                 return False
-            if monotonic() >= lease.end or lease.requests >= 16:
+            if monotonic() >= lease.end:
                 self.counts["read_budget"] += 1
-                return False
+                raise TimeoutError("static read budget exhausted")
+            if lease.requests >= 16:
+                self.counts["read_item_limit"] += 1
+                raise Unsupported("static read item limit reached")
             lease.requests += 1
             token = _scope.set(None)
             try:
@@ -173,9 +229,9 @@ class ResourceReads:
             except (PermissionError, ssl.SSLError, Unsupported, ValueError) as exc:
                 self.counts[type(exc).__name__] += 1
                 raise
-            except (OSError, TimeoutError) as exc:
+            except OSError as exc:
                 self.counts[type(exc).__name__] += 1
-                result = False
+                raise
             finally:
                 _scope.reset(token)
             if not result:
@@ -192,16 +248,28 @@ class ResourceReads:
             raise PermissionError("public mirror denied static read")
         if status != 200:
             self.counts[f"http_{status}"] += 1
-            return None
+            if status in (404, 410):
+                return None
+            raise OSError(f"static resource returned HTTP {status}")
         if len(data) > limit:
             raise Unsupported("static read exceeds its byte limit")
         return data
 
     def _index(self, url, deadline, *, fresh=False):
+        if fresh:
+            return self._listing(url, deadline)
         cached = self.indexes.get(url)
         if not fresh and cached and monotonic() < cached[0]:
             self.indexes.move_to_end(url)
             return cached[1]
+        entries = self._listing(url, deadline)
+        if entries is not None:
+            self.indexes[url] = (monotonic() + 60, entries)
+            if len(self.indexes) > 32:
+                self.indexes.popitem(last=False)
+        return entries
+
+    def _listing(self, url, deadline):
         data = self._read(url, 256 * 1024, deadline)
         if data is None:
             return None
@@ -210,14 +278,12 @@ class ResourceReads:
         page.close()
         if not page.listing or not page.done or len(page.entries) > 1024:
             raise Unsupported("invalid static directory index")
-        self.indexes[url] = (monotonic() + 60, page.entries)
-        if len(self.indexes) > 32:
-            self.indexes.popitem(last=False)
         return page.entries
 
     def _source(self, parent, lease):
         route, base = self.folders[parent]
         base = base or self.port.mirror._selected
+        unavailable = None
         for origin in (base,) if base else DEFAULT_MIRRORS:
             url = origin + self.namespace + route + "/"
             try:
@@ -226,13 +292,16 @@ class ResourceReads:
                 )
             except (PermissionError, ssl.SSLError):
                 raise
-            except OSError:
+            except OSError as exc:
                 if base:
                     raise
+                unavailable = exc
                 self.counts["mirror_unavailable"] += 1
                 continue
             if entries is not None:
                 return url, entries
+        if unavailable is not None:
+            raise unavailable
         return None, None
 
     def _resolve(self, parent, parts, target, lease):
@@ -296,25 +365,94 @@ class ResourceReads:
     def _verify_hash(self, origin, source_key, data, lease):
         # XutheringWavesUID's check_resource_hash compares SHA-256 values from
         # each published JSON object against repository-relative source paths.
-        if not any(route == self.hash_route for route, _ in self.folders.values()):
-            raise Unsupported("upstream checksum directory was not declared")
+        if not any(
+            route == self.hash_route and (base or self.port.mirror._selected) == origin
+            for route, base in self.folders.values()
+        ):
+            raise Unsupported(
+                "upstream checksum directory was not declared for this mirror"
+            )
         directory = origin + self.namespace + self.hash_route + "/"
-        stamp = self.checksums.get(directory)
         actual = sha256(data).digest()
-        if stamp and monotonic() < stamp[0] and stamp[1].get(source_key) == actual:
-            self.checksums.move_to_end(directory)
-            self.counts["checksum_set_cache_hits"] += 1
-            return
-        # A cached miss or mismatch cannot authorize a newly published file.
-        digests = self._load_checksums(directory, lease)
-        self.checksums[directory] = (monotonic() + 60, digests)
-        if len(self.checksums) > 2:
-            self.checksums.popitem(last=False)
-        self.counts["checksum_sets_loaded"] += 1
+        with self.metadata_lock:
+            stamp = self.checksums.get(directory)
+            if stamp and monotonic() < stamp[0] and stamp[1].get(source_key) == actual:
+                self.checksums.move_to_end(directory)
+                self.counts["checksum_set_cache_hits"] += 1
+                return
+            future = self._metadata_job(directory, 24 * 1024 * 1024 - lease.bytes)
+        # A published asset never becomes 'absent' because the full checksum
+        # collection is still in flight. A caller may retry within a new lease.
+        try:
+            digests, size = future.result(timeout=max(0, lease.end - monotonic()))
+        except Exception as exc:
+            with self.metadata_lock:
+                if self.metadata_jobs.get(directory) is future and future.done():
+                    self.reported_failures.add(directory)
+                elif isinstance(exc, TimeoutError):
+                    self.counts["checksum_wait_timeout"] += 1
+                    raise TimeoutError(
+                        "complete public checksum collection is still loading"
+                    ) from exc
+            raise
+        if lease.bytes + size > 24 * 1024 * 1024:
+            raise Unsupported("published checksum collection exceeds read budget")
+        lease.bytes += size
         expected = digests.get(source_key)
         if expected is not None and expected != actual:
             self.counts["unverified_checksum"] += 1
             raise Unsupported("incorrect published checksum")
+
+    def _metadata_job(self, directory, limit=_manifest_bytes_cap):
+        # Caller holds metadata_lock. The source identity is the full declared
+        # directory including the selected origin. Files from mirrors never mix.
+        if self.closed:
+            raise Unsupported("public resource generation retired")
+        prior = self.metadata_jobs.get(directory)
+        if prior is not None:
+            if not prior.done():
+                self.counts["checksum_set_joined"] += 1
+                return prior
+            if (
+                prior.exception() is not None
+                and directory not in self.reported_failures
+            ):
+                return prior  # Surface the recorded failure before a same-source retry.
+        elif len(self.metadata_jobs) >= 2:
+            retired = next((d for d, f in self.metadata_jobs.items() if f.done()), None)
+            if retired is None:
+                raise Unsupported("concurrent checksum origin limit exceeded")
+            del self.metadata_jobs[retired]
+            self.reported_failures.discard(retired)
+        self.reported_failures.discard(directory)
+        if self.metadata_pool is None:
+            self.metadata_pool = ThreadPoolExecutor(max_workers=1)
+        future = self.metadata_pool.submit(
+            self._prepare_set, directory, min(limit, _manifest_bytes_cap)
+        )
+        self.metadata_jobs[directory] = future
+        return future
+
+    def _prepare_set(self, directory, limit):
+        # This is part of the original requested bulk metadata, with an
+        # independent bounded deadline. A single slow chat must not cancel it.
+        initial = 24 * 1024 * 1024 - limit
+        lease = _Lease(self, end=monotonic() + 24, bytes=initial)
+        try:
+            digests = self._load_checksums(directory, lease)
+            with self.metadata_lock:
+                if self.closed:
+                    raise Unsupported("public resource generation retired")
+                self.checksums[directory] = (monotonic() + 60, digests)
+                if len(self.checksums) > 2:
+                    self.checksums.popitem(last=False)
+                self.counts["checksum_sets_loaded"] += 1
+            return digests, lease.bytes - initial
+        except Exception as exc:
+            with self.metadata_lock:
+                self.checksums.pop(directory, None)
+                self.counts["checksum_set_failure_" + type(exc).__name__] += 1
+            raise
 
     def _load_checksums(self, directory, lease):
         listing = self._index(directory, lease.end, fresh=True)
@@ -351,11 +489,10 @@ class ResourceReads:
                 raise Unsupported("incomplete published checksum data")
             return raw
 
-        # Four reads leave one of the five broker slots available for the
-        # concurrent upstream bulk request. Every transfer has the same deadline.
+        # Leave independent slots for foreground data and the original bulk job.
         digests = {}
         entries = 0
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             results = [pool.submit(load, item) for item in files.items()]
             try:
                 for result in results:

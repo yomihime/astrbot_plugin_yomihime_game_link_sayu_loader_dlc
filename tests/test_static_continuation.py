@@ -141,7 +141,7 @@ class StaticTransport(IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 3)
 
 
-class Continuation(IsolatedAsyncioTestCase):
+class BatchCompletion(IsolatedAsyncioTestCase):
     def setUp(self):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -166,72 +166,59 @@ class Continuation(IsolatedAsyncioTestCase):
         with resource_broker.startup_resources():
             await mirror.download_all_file("Fixture", self.dirs, URL=self.base)
 
-    async def test_nested_cursor_resumes_only_unvisited_items(self):
+    async def test_post_download_code_sees_terminal_files_and_explicit_retry(self):
+        self.dirs.update({"more": self.root / "more"})
+
         async def respond(req):
-            p = req.url.path
-            self.hits[p] += 1
-            items = None
-            if p.endswith("/icons/"):
-                items = [("gone.json", "2"), ("sub/", "-"), ("last.json", "2")]
-            elif p.endswith("/sub/"):
-                items = [("done.json", "2"), ("cut.json", "2")]
-            if items:
-                html = (
-                    "<pre>"
-                    + "".join(
-                        f'<a href="{name}">{name}</a> 12:00 {size}\n'
-                        for name, size in items
-                    )
-                    + "</pre>"
+            path = req.url.path
+            self.hits[path] += 1
+            if path.endswith("/"):
+                return httpx2.Response(
+                    200, content=b'<pre><a href="file.json">f</a> 2</pre>'
                 )
-                return httpx2.Response(200, content=html.encode())
-            if p.endswith("/gone.json"):
-                return httpx2.Response(404)
-            if p.endswith("/cut.json") and self.reader.budget:
+            if path.endswith("/more/file.json") and self.reader.budget is not None:
                 raise StartupTransferLimit("fixture timeout")
             return httpx2.Response(200, content=b"{}")
 
         mirror = self.mirror(respond)
-        await self.startup(mirror)
-        await self.startup(mirror)
-        jobs = mirror.diagnostics()["continuations"]
-        self.assertEqual(
-            [(j["state"], j["pending_roots"]) for j in jobs], [("queued", 1)]
+        after = []
+        try:
+            await self.startup(mirror)
+            after.append("success")
+        except StartupTransferLimit:
+            after.append("limited")
+        snapshot = sorted(
+            p.relative_to(self.root).as_posix() for p in self.root.rglob("*.json")
         )
-        self.assertFalse((self.root / "icons/sub/cut.json").exists())
-        mirror.start_continuations()
-        mirror.start_continuations()
-        await mirror._runner
-        await mirror.stop_continuations()
-        self.assertTrue(
-            all(
-                n == (2 if p.endswith("/cut.json") else 1) for p, n in self.hits.items()
-            )
-        )
-        self.assertEqual((self.root / "icons/sub/cut.json").read_bytes(), b"{}")
-        self.assertEqual((self.root / "icons/last.json").read_bytes(), b"{}")
-        (job,) = mirror.diagnostics()["continuations"]
+        self.assertEqual((after, snapshot), (["limited"], ["icons/file.json"]))
+        hits = self.hits.copy()
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.hits, hits)
+        self.assertFalse((self.root / "more/file.json").exists())
         self.assertEqual(
-            (
-                job["state"],
-                job["failed_reads"],
-                job["pending_roots"],
-                job["published_bytes"],
-            ),
-            ("partial", 1, 0, 6),
+            mirror.diagnostics()["startup_outcomes"], {"startup_budget_exhausted": 1}
+        )
+        (first,) = mirror.diagnostics()["batches"]
+        self.assertEqual(
+            (first["state"], first["finished_roots"], first["pending_roots"]),
+            ("limited", 1, 1),
+        )
+        await mirror.download_all_file("Fixture", self.dirs, URL=self.base)
+        self.assertEqual(self.hits["/Fixture/icons/file.json"], 1)
+        self.assertEqual((self.root / "more/file.json").read_bytes(), b"{}")
+        self.assertEqual(
+            mirror.diagnostics()["batch_outcomes"], {"limited": 1, "completed": 1}
         )
 
-    async def test_retire_and_hard_errors_never_publish_or_retry(self):
+    async def test_soft_response_hard_failure_and_retirement(self):
         for outcome in ("cancel", "denied", "corrupt", "ordinary"):
             gate = asyncio.Event()
 
             async def respond(req):
                 if req.url.path.endswith("/"):
                     return httpx2.Response(
-                        200, content=b'<pre><a href="res.json">res</a> 0 2\n</pre>'
+                        200, content=b'<pre><a href="res.json">r</a> 2</pre>'
                     )
-                if self.reader.budget and outcome != "ordinary":
-                    raise StartupTransferLimit("fixture timeout")
                 gate.set()
                 if outcome == "cancel":
                     await asyncio.Event().wait()
@@ -240,38 +227,83 @@ class Continuation(IsolatedAsyncioTestCase):
                 return httpx2.Response(404 if outcome == "ordinary" else 403)
 
             mirror = self.mirror(respond)
-            await self.startup(mirror)
-            mirror.start_continuations()
-            if outcome == "ordinary":
-                self.assertEqual(mirror.diagnostics()["continuations"], [])
-                continue
+            job = asyncio.create_task(self.startup(mirror))
             await asyncio.wait_for(gate.wait(), timeout=2)
-            if outcome != "cancel":
-                await mirror._runner
-            await mirror.stop_continuations()
-            (job,) = mirror.diagnostics()["continuations"]
+            if outcome == "cancel":
+                job.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await job
+                state = "cancelled"
+            elif outcome == "ordinary":
+                self.assertIsNone(await job)
+                state = "soft_failures"
+            else:
+                with self.assertRaises((PermissionError, ValueError)):
+                    await job
+                state = "failed"
+            (row,) = mirror.diagnostics()["batches"]
             self.assertEqual(
-                job["state"], "cancelled" if outcome == "cancel" else "failed"
+                (row["state"], row["pending_roots"]),
+                (state, 0 if outcome == "ordinary" else 1),
             )
-            self.assertEqual(job["pending_roots"], 1)
             self.assertFalse((self.root / "icons/res.json").exists())
 
-    async def test_generation_queue_is_bounded_and_reports_completed_roots(self):
-        def respond(req):
-            if self.reader.budget:
-                raise StartupTransferLimit("fixture timeout")
-            self.hits[req.url.path] += 1
+    async def test_atomic_write_finishes_before_cancellation_returns(self):
+        import threading
+
+        entered, release = threading.Event(), threading.Event()
+
+        async def respond(req):
+            if req.url.path.endswith("/"):
+                return httpx2.Response(
+                    200, content=b'<pre><a href="ok.json">ok</a> 2</pre>'
+                )
+            return httpx2.Response(200, content=b"{}")
+
+        mirror = self.mirror(respond)
+        publish = mirror.port._write
+
+        def delayed(*args, **kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError()
+            return publish(*args, **kwargs)
+
+        with patch.object(mirror.port, "_write", side_effect=delayed):
+            task = asyncio.create_task(self.startup(mirror))
+            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+            task.cancel()
+            await asyncio.sleep(0.02)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual((self.root / "icons/ok.json").read_bytes(), b"{}")
+        row = mirror.diagnostics()["batches"][-1]
+        self.assertEqual((row["state"], row["published_files"]), ("cancelled", 1))
+
+    async def test_each_declared_root_has_its_own_page_and_children_remain_bounded(
+        self,
+    ):
+        async def respond(req):
+            if req.url.path.endswith("/wide/"):
+                children = "".join(f'<a href="s{i}/">s</a> - ' for i in range(33))
+                return httpx2.Response(200, content=f"<pre>{children}</pre>".encode())
             return httpx2.Response(200, content=b"<pre></pre>")
 
         mirror = self.mirror(respond)
-        for index in range(5):
-            self.dirs = {f"root{index}": self.root / f"root{index}"}
-            await self.startup(mirror)
-        self.assertEqual(mirror.diagnostics()["counts"]["continuation_capacity"], 1)
-        mirror.start_continuations()
-        await mirror._runner
-        await mirror.stop_continuations()
-        jobs = mirror.diagnostics()["continuations"]
-        self.assertEqual([j["state"] for j in jobs], ["completed"] * 4)
-        self.assertEqual(sum(j["pending_roots"] for j in jobs), 0)
-        self.assertNotIn("/Fixture/root4/", self.hits)
+        dirs = {f"root{i}": self.root / f"root{i}" for i in range(34)}
+        await mirror.download_all_file("Fixture", dirs, URL=self.base)
+        row = mirror.diagnostics()["batches"][-1]
+        self.assertEqual(
+            (row["state"], row["index_pages"], row["child_index_pages"]),
+            ("completed", 34, 0),
+        )
+        dirs["wide"] = self.root / "wide"
+        with self.assertRaises(Unsupported):
+            await mirror.download_all_file("Fixture", dirs, URL=self.base)
+        row = mirror.diagnostics()["batches"][-1]
+        self.assertEqual(
+            (row["state"], row["reason"], row["child_index_pages"]),
+            ("limited", "directory_limit", 32),
+        )

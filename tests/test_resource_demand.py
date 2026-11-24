@@ -4,6 +4,7 @@ from hashlib import sha256
 from io import BytesIO
 import json
 import os
+from time import monotonic
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "worker"))
 from plugin_downloads import Downloads  # noqa: E402
 from port_errors import Unsupported  # noqa: E402
 from resource_demand import ResourcePath, ResourceReads, install_read_audit  # noqa: E402
+import resource_demand  # noqa: E402
 
 
 def listing(entries):
@@ -103,6 +105,8 @@ class DemandTest(IsolatedAsyncioTestCase):
             self.port, self.profile, SimpleNamespace(read_before=self.read)
         )
         self.port.mirror.demand = self.reads
+        self.addCleanup(self.reads.join)
+        self.addCleanup(self.reads.close)
         install_read_audit()
 
     def read(self, url, limit, deadline):
@@ -214,7 +218,8 @@ class DemandTest(IsolatedAsyncioTestCase):
             ("missing", False),
             ("denied", PermissionError),
             ("short", Unsupported),
-            ("timeout", False),
+            ("timeout", TimeoutError),
+            ("server_error", OSError),
             ("bad_hash", Unsupported),
             ("good", True),
         ):
@@ -227,6 +232,7 @@ class DemandTest(IsolatedAsyncioTestCase):
                     "denied": (403, [], b""),
                     "short": b"{",
                     "timeout": TimeoutError(),
+                    "server_error": (503, [], b""),
                     "bad_hash": payload,
                     "good": payload,
                 }[state]
@@ -364,3 +370,121 @@ class DemandTest(IsolatedAsyncioTestCase):
                 (self.local / "a.json").read_bytes()
             self.assertFalse(Path(self.local / "a.json").is_file())
             self.assertFalse(self.reads.checksums)
+
+    async def test_declared_background_set_is_shared_and_outlives_a_slow_read(self):
+        self.reads.hash_route = "hash"
+        checks = self.base + "/Fixture/hash/"
+        doc = json.dumps({"wiki/art/first.json": sha256(b"{}").hexdigest()}).encode()
+        gate, entered = Event(), Event()
+
+        def delayed():
+            entered.set()
+            if not gate.wait(3):
+                raise AssertionError("test did not release manifest")
+            return doc
+
+        self.wire = {
+            checks: listing([("one.json", len(doc))]),
+            checks + "one.json": delayed,
+            self.index: listing([("first.json", 2)]),
+            self.index + "first.json": b"{}",
+        }
+        await self.declare({"wiki/art": self.local, "hash": self.local.parent / "hash"})
+        self.assertFalse(self.calls)  # Actual declaration alone cannot delay ready.
+        self.reads.start()
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+            self.reads.start()
+            with self.reads.scope():
+                resource_demand._scope.get().end = monotonic() + 0.05
+                with self.assertRaisesRegex(TimeoutError, "still loading"):
+                    (self.local / "first.json").read_bytes()
+            self.assertFalse(Path(self.local / "first.json").is_file())
+            self.assertEqual(
+                self.reads.diagnostics()["checksum_sets"][0]["state"], "loading"
+            )
+        finally:
+            gate.set()
+        await asyncio.to_thread(self.reads.metadata_jobs[checks].result, 2)
+        with self.reads.scope():
+            self.assertEqual((self.local / "first.json").read_bytes(), b"{}")
+        self.assertEqual(self.calls[checks + "one.json"], 1)
+        self.assertEqual(self.calls[checks], 1)
+        self.assertEqual(self.reads.counts["checksum_set_joined"], 1)
+
+    async def test_prefetch_requires_actual_same_origin_and_preserves_hard_failure(
+        self,
+    ):
+        self.reads.hash_route = "hash"
+        checks = self.base + "/Fixture/hash/"
+        self.reads.start()
+        await self.declare()
+        self.assertFalse(self.reads.metadata_jobs)
+        self.wire = {
+            checks: (403, [], b""),
+            self.index: listing([("one.json", 2)]),
+            self.index + "one.json": b"{}",
+        }
+        await self.declare({"hash": self.local.parent / "hash"})
+        future = self.reads.metadata_jobs[checks]
+        with self.assertRaises(PermissionError):
+            await asyncio.to_thread(future.result, 2)
+        with self.reads.scope(), self.assertRaises(PermissionError):
+            (self.local / "one.json").exists()
+        self.assertEqual(self.calls[checks], 1)
+        self.assertEqual(
+            self.reads.diagnostics()["checksum_sets"][0]["state"], "PermissionError"
+        )
+        self.assertFalse(Path(self.local / "one.json").is_file())
+
+    async def test_verification_never_uses_another_declared_origin(self):
+        alternate = "https://another.example.org"
+        self.reads.hash_route = "hash"
+        self.port.mirror.bases += (alternate,)
+        await self.declare()
+
+        async def no_bulk_data(url, limit):
+            return 404, b""
+
+        with patch.object(self.port, "_read", no_bulk_data):
+            await self.port.mirror.download_all_file(
+                "Fixture", {"hash": self.local.parent / "hash"}, URL=alternate
+            )
+        self.wire = {
+            self.index: listing([("one.json", 2)]),
+            self.index + "one.json": b"{}",
+            alternate + "/Fixture/hash/": listing([]),
+        }
+        self.reads.start()
+        await asyncio.to_thread(
+            self.reads.metadata_jobs[alternate + "/Fixture/hash/"].result, 2
+        )
+        with self.reads.scope(), self.assertRaisesRegex(Unsupported, "for this mirror"):
+            (self.local / "one.json").read_bytes()
+        self.assertFalse(Path(self.local / "one.json").is_file())
+        self.assertNotIn(self.base + "/Fixture/hash/", self.calls)
+
+    async def test_retire_discards_inflight_checksum_result(self):
+        self.reads.hash_route = "hash"
+        checks = self.base + "/Fixture/hash/"
+        entered, release = Event(), Event()
+
+        def delayed():
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("test did not release checksum request")
+            return b"{}"
+
+        self.wire = {checks: listing([("one.json", 2)]), checks + "one.json": delayed}
+        await self.declare({"hash": self.local.parent / "hash"})
+        self.reads.start()
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+            self.reads.close()
+        finally:
+            release.set()
+        await asyncio.to_thread(self.reads.join)
+        self.assertFalse(self.reads.checksums)
+        self.assertEqual(
+            self.reads.diagnostics()["checksum_sets"][0]["state"], "retired"
+        )

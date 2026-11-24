@@ -78,11 +78,14 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
         for cap in module["capabilities"]
         if cap["effect"] == "write" and cap["privacy_floor"] == "owner"
     )
-    static_urls, directories = (), ()
+    static_urls, directories, stream_objects = (), (), ()
     if public_resources_only:
         from resource_policy import from_snapshot
 
-        static_urls, directories = from_snapshot(snapshot, lock)
+        stream_objects = []
+        static_urls, directories = from_snapshot(
+            snapshot, lock, stream_objects=stream_objects, policy=policy
+        )
     files["game_profile.py"] = (
         f"PACKAGE = {lock['package']!r}\nPREFIX = {lock['prefix']!r}\n"
         f"RUNTIME_MODE = {lock.get('runtime_mode', 'package')!r}\n"
@@ -90,6 +93,7 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
         f"OWNER_WRITES = {owner_writes!r}\n"
         f"PUBLIC_RESOURCES_ONLY = {public_resources_only!r}\n"
         f"STATIC_RESOURCE_URLS = {tuple(static_urls)!r}\n"
+        f"STATIC_STREAM_OBJECTS = {tuple(sorted(stream_objects))!r}\n"
         f"STATIC_RESOURCE_DIRECTORIES = {tuple(directories)!r}\n"
         f"SHA256_MANIFEST_DIRECTORY = {policy.get('sha256_manifest_directory')!r}\n"
         f"PUBLIC_IMAGE_ORIGINS = {tuple(policy.get('image_origins', ()))!r}\n"

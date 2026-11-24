@@ -256,9 +256,8 @@ class StartupMirrorTest(IsolatedAsyncioTestCase):
             dirs = {name: root / name for name in ("first", "second", "third")}
             with patch.object(resource_broker, "CLIENT", reader):
                 with resource_broker.startup_resources():
-                    self.assertIsNone(
+                    with self.assertRaises(StartupTransferLimit):
                         await port.mirror.download_all_file("Fixture", dirs, URL=base)
-                    )
                 self.assertIsNone(reader.budget)
                 counts = port.mirror.diagnostics()["counts"]
                 self.assertEqual(counts["startup_incomplete"], 2)

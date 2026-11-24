@@ -16,6 +16,18 @@
     "bulk_mirrors": []
   },
   "XutheringWavesUID": {
+    "stream_object": {
+      "declaration": "XutheringWavesUID/XutheringWavesUID/utils/resource/download_all_resource.py",
+      "sha256": "8f5b5f0fffec35e3a90055ef7a7a3cec3ebf9817345d84ecf25c2655d8f74953",
+      "function": "check_speed",
+      "origins": "URL_LIB",
+      "url": "test_url",
+      "origin_parameter": "base_url",
+      "package_parameter": "plugin_name",
+      "object": "speedtest",
+      "mime": "application/octet-stream",
+      "bytes": 1048576
+    },
     "sha256_manifest_directory": "resource/hash",
     "image_origins": [
       "https://prod-alicdn-community.kurobbs.com",

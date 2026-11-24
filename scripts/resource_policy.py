@@ -1,7 +1,7 @@
 """Collect static resource declarations from the checksum-verified game archive."""
 
 import ast
-from hashlib import file_digest
+from hashlib import file_digest, sha256
 import re
 from zipfile import ZipFile
 
@@ -98,7 +98,59 @@ def _static_table_images(tree):
             bindings.pop(target, None)
 
 
-def from_snapshot(path, lock):
+def _stream_objects(body, declaration, mirrors, package):
+    if sha256(body).hexdigest() != declaration["sha256"]:
+        raise ValueError("static stream declaration changed")
+    fn = next(
+        n
+        for n in ast.parse(body).body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == declaration["function"]
+    )
+    assignments = {
+        n.targets[0].id: n.value
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+    }
+    template = assignments[declaration["url"]]
+    table_node = next(
+        n.value
+        for n in fn.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == declaration["origins"]
+        and isinstance(n.value, ast.Dict)
+    )
+    table = ast.literal_eval(table_node)
+    # A source-literal mirror, the owning package and the approved object must
+    # resolve to the same exact upstream GET URL in the pinned source.
+    if not any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "stream"
+        and len(n.args) == 2
+        and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value == "GET"
+        and isinstance(n.args[1], ast.Name)
+        and n.args[1].id == declaration["url"]
+        for n in ast.walk(fn)
+    ):
+        raise ValueError("missing upstream streaming GET")
+    for base in sorted(set(table.values())):
+        if base.rstrip("/") not in mirrors:
+            continue
+        bindings = {
+            declaration["origin_parameter"]: base,
+            declaration["package_parameter"]: package,
+        }
+        url = _constant_string(template, bindings)
+        if url != base + package + "/" + declaration["object"]:
+            raise ValueError("invalid static stream declaration")
+        yield url, declaration["mime"], declaration["bytes"]
+
+
+def from_snapshot(path, lock, *, stream_objects=None, policy=None):
     images, directories = set(), set()
     with path.open("rb") as stream:
         if file_digest(stream, "sha256").hexdigest() != lock["snapshot_sha256"]:
@@ -111,6 +163,15 @@ def from_snapshot(path, lock):
                 ):
                     continue
                 body = source.read(name)
+                declaration = (policy or {}).get("stream_object", {})
+                if stream_objects is not None and name == declaration.get(
+                    "declaration"
+                ):
+                    stream_objects.extend(
+                        _stream_objects(
+                            body, declaration, policy["bulk_mirrors"], lock["package"]
+                        )
+                    )
                 if b"https://" not in body and b"download_all_file" not in body:
                     continue
                 tree = ast.parse(body)
@@ -166,4 +227,8 @@ def from_snapshot(path, lock):
                                     and isinstance(key.value, str)
                                     and DIRECTORY.fullmatch(key.value)
                                 )
+    if (policy or {}).get("stream_object") and len(stream_objects) != len(
+        policy["bulk_mirrors"]
+    ):
+        raise ValueError("incomplete source declaration for static stream")
     return sorted(images), sorted(directories)

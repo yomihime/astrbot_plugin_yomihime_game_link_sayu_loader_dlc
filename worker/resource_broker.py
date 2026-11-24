@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from http.client import IncompleteRead
 from io import BytesIO
+import asyncio
 import itertools
 import json
 import os
@@ -70,6 +71,14 @@ class StartupBudget:
 
 @contextmanager
 def startup_resources():
+    from resource_httpx import stream_scope
+
+    with stream_scope(), _startup_budget():
+        yield
+
+
+@contextmanager
+def _startup_budget():
     reader = CLIENT
     if reader is None:
         yield
@@ -225,6 +234,18 @@ def _header(value):
     )
 
 
+def stream_spec(url, profile):
+    for declared, mime, size in getattr(profile, "STATIC_STREAM_OBJECTS", ()):
+        if (
+            url == declared
+            and mime == "application/octet-stream"
+            and type(size) is int
+            and 0 < size <= 1048576
+        ):
+            return mime, size
+    raise Unsupported("object is outside the static stream declarations")
+
+
 def serve():
     import game_profile
 
@@ -233,6 +254,43 @@ def serve():
     incoming, outgoing = sys.stdin.buffer, sys.stdout.buffer
     writer = Lock()
     slots = BoundedSemaphore(5)
+    controls = {}
+    controls_lock = Lock()
+
+    def write(number, status, headers, data):
+        with writer:
+            outgoing.write(_header([number, status, headers, len(data)]))
+            outgoing.write(data)
+            outgoing.flush()
+
+    def stream(number, url, deadline, control):
+        from plugin_public_http import stream_public_https
+
+        def emit(status, headers, data):
+            if control.stopped:
+                raise InterruptedError("stream retired")
+            write(number, status, headers, data)
+
+        try:
+            mime, size = stream_spec(url, game_profile)
+            if type(deadline) not in (float, int) or not 0 < deadline < float("inf"):
+                raise Unsupported("invalid public stream deadline")
+            stream_public_https(
+                url, mime, size, min(deadline, monotonic() + 15), control, emit
+            )
+            emit("eof", [], b"")
+        except (ConnectionError, InterruptedError, TimeoutError):
+            write(number, "unavailable", [], b"")
+        except ssl.SSLError:
+            write(number, "tls", [], b"")
+        except PermissionError:
+            write(number, "denied", [], b"")
+        except Exception:
+            write(number, "invalid", [], b"")
+        finally:
+            with controls_lock:
+                controls.pop(number, None)
+            slots.release()
 
     def respond(number, url, limit, deadline):
         try:
@@ -276,10 +334,86 @@ def serve():
             isinstance(request, list) and len(request) == 4 and type(request[0]) is int
         ):
             break
-        slots.acquire()
+        number, arg, limit, deadline = request
+        if arg in ("cancel_stream", "ack_stream"):
+            with controls_lock:
+                control = controls.get(number)
+                if control is not None:
+                    if arg == "cancel_stream":
+                        control.cancel()
+                    else:
+                        control.acknowledge()
+            continue
+        if not slots.acquire(blocking=False):
+            write(number, "unavailable", [], b"")
+            continue
+        if arg == "stream":
+            from plugin_public_http import StreamControl
+
+            control = StreamControl()
+            with controls_lock:
+                controls[number] = control
+            Thread(
+                target=stream, args=(number, limit, deadline, control), daemon=True
+            ).start()
+            continue
         # Each reader is bounded and stateless. Pipe EOF must also retire a
         # reader whose DNS resolver is still waiting after its owner exits.
         Thread(target=respond, args=request, daemon=True).start()
+
+
+class Stream:
+    """One bounded wire response, received on the reader thread, consumed on its event loop."""
+
+    def __init__(self, reader, number, deadline):
+        self.reader = reader
+        self.number = number
+        self.deadline = deadline
+        self.loop = asyncio.get_running_loop()
+        self.frames = asyncio.Queue()
+        self.closed = False
+        self.consumed = 0
+
+    async def next(self):
+        async with asyncio.timeout_at(
+            self.loop.time() + max(0, self.deadline - monotonic())
+        ):
+            status, headers, data = await self.frames.get()
+        if status == "tls":
+            raise ssl.SSLError("public stream TLS verification failed")
+        if status == "denied":
+            raise PermissionError("public stream denied")
+        if status == "invalid":
+            raise Unsupported("invalid public stream response")
+        if status == "unavailable":
+            raise ConnectionError("public stream unavailable")
+        if status == "chunk" and not self.closed:
+            self.consumed += 1
+            if self.consumed % 4 == 0:
+                with self.reader.lock:
+                    self.reader.process.stdin.write(
+                        _header([self.number, "ack_stream", None, None])
+                    )
+                    self.reader.process.stdin.flush()
+        return status, headers, data
+
+    def cancel(self):
+        if self.closed:
+            return
+        self.closed = True
+        with self.reader.lock:
+            self.reader.streams.pop(self.number, None)
+            try:
+                if not self.reader.process.stdin.closed:
+                    self.reader.process.stdin.write(
+                        _header([self.number, "cancel_stream", None, None])
+                    )
+                    self.reader.process.stdin.flush()
+            except (OSError, ValueError):
+                pass
+        # Wake an iterator whose callback retired before the next network frame.
+        self.frames.put_nowait(("unavailable", [], b""))
+        self.reader.slots.release()
 
 
 class Reader:
@@ -288,6 +422,7 @@ class Reader:
         self.lock = Lock()
         self.ids = itertools.count(1)
         self.waiting = {}
+        self.streams = {}
         self.budget = None
         self.startup_diagnostics = {}
         self.slots = BoundedSemaphore(5)
@@ -312,14 +447,39 @@ class Reader:
                 if len(data) != size:
                     break
                 with self.lock:
+                    pipe = self.streams.get(number)
                     future = self.waiting.pop(number, None)
-                if future is not None:
+                if pipe is not None:
+                    pipe.loop.call_soon_threadsafe(
+                        pipe.frames.put_nowait, (status, headers, data)
+                    )
+                elif future is not None:
                     future.set_result((status, headers, data))
         finally:
             with self.lock:
                 for future in self.waiting.values():
                     future.set_exception(ConnectionError("resource reader closed"))
                 self.waiting.clear()
+                for pipe in self.streams.values():
+                    pipe.loop.call_soon_threadsafe(
+                        pipe.frames.put_nowait, ("unavailable", [], b"")
+                    )
+
+    def stream(self, url, deadline):
+        if not self.slots.acquire(blocking=False):
+            raise TimeoutError("public reader slots unavailable")
+        with self.lock:
+            number = next(self.ids)
+            try:
+                pipe = Stream(self, number, deadline)
+                self.streams[number] = pipe
+                self.process.stdin.write(_header([number, "stream", url, deadline]))
+                self.process.stdin.flush()
+                return pipe
+            except BaseException:
+                self.streams.pop(number, None)
+                self.slots.release()
+                raise
 
     def read(self, url, limit):
         if not isinstance(url, str) or len(url) > 2048 or not url.isascii():
