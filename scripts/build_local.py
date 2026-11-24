@@ -90,9 +90,11 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
     )
     static_urls, directories, stream_objects = (), (), ()
     platform_indexes = {}
+    pinned_images = {}
     if public_resources_only:
-        from resource_policy import from_snapshot
+        from resource_policy import from_snapshot, published_images
 
+        pinned_images = published_images(snapshot, lock, policy, ROOT / "profiles")
         stream_objects = []
         static_urls, directories = from_snapshot(
             snapshot,
@@ -111,6 +113,7 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
         f"OWNER_WRITES = {owner_writes!r}\n"
         f"PUBLIC_RESOURCES_ONLY = {public_resources_only!r}\n"
         f"STATIC_RESOURCE_URLS = {tuple(static_urls)!r}\n"
+        f"PUBLISHED_IMAGE_DIGESTS = {pinned_images!r}\n"
         f"STATIC_STREAM_OBJECTS = {tuple(sorted(stream_objects))!r}\n"
         f"STATIC_RESOURCE_DIRECTORIES = {tuple(directories)!r}\n"
         f"STATIC_PLATFORM_INDEXES = {frozen_indexes!r}\n"

@@ -129,6 +129,7 @@ def static_httpx(profile, reader):
                 or (
                     url not in objects
                     and url not in profile.STATIC_RESOURCE_URLS
+                    and url not in getattr(profile, "PUBLISHED_IMAGE_DIGESTS", {})
                     and not ambr_asset(url)
                 )
                 or request.headers.get("host") != request.url.host

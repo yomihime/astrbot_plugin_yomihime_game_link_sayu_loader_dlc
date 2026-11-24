@@ -2,6 +2,7 @@
 
 import ast
 from hashlib import file_digest, sha256
+import json
 import re
 from zipfile import ZipFile
 
@@ -9,6 +10,43 @@ IMAGE = re.compile(
     r"https://[A-Za-z0-9.-]+/[A-Za-z0-9_./%~-]+\.(?:png|jpe?g|webp|gif|avif)", re.I
 )
 DIRECTORY = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)+")
+
+
+def published_images(snapshot, lock, policy, registry):
+    """Bind the reviewed image checksums to IDs in the locked source archive."""
+    spec = policy.get("published_images")
+    if not spec:
+        return {}
+    with snapshot.open("rb") as stream:
+        if file_digest(stream, "sha256").hexdigest() != lock["snapshot_sha256"]:
+            raise ValueError("image catalog requires the pinned source archive")
+        stream.seek(0)
+        with ZipFile(stream) as archive:
+            identifiers = json.loads(archive.read(spec["source_ids"]))
+    body = (registry / spec["ledger"]).read_bytes().replace(b"\r\n", b"\n")
+    if sha256(body).hexdigest() != spec["ledger_sha256"]:
+        raise ValueError("published image checksums changed")
+    rows = json.loads(body)["objects"]
+    result = {}
+    for key, (size, checksum, width, height) in sorted(rows.items()):
+        if (
+            key not in identifiers
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key)
+            or type(size) is not int
+            or not 0 < size <= 256 * 1024
+            or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+            or any(
+                type(side) is not int or not 0 < side <= 512 for side in (width, height)
+            )
+        ):
+            raise ValueError("invalid published image record")
+        result[spec["origin_directory"] + "/" + key + ".png"] = (
+            size,
+            checksum,
+            width,
+            height,
+        )
+    return result
 
 
 def _values(fn, expression):

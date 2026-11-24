@@ -1,4 +1,5 @@
 import io
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "worker")]
 from port_errors import Unsupported  # noqa: E402
 from plugin_public_http import PublishedImages  # noqa: E402
 from resource_broker import MAX_FILE, MAX_INDEX, allowed, fetch  # noqa: E402
-from resource_policy import from_snapshot  # noqa: E402
+from resource_policy import from_snapshot, published_images  # noqa: E402
 import resource_broker  # noqa: E402
 from port_errors import StartupTransferLimit  # noqa: E402
 
@@ -93,6 +94,74 @@ class BrokerTest(TestCase):
             return_value=(302, [("Location", "https://elsewhere.invalid")], b"private"),
         ):
             self.assertEqual(fetch(url, 512, self.profile), (302, [], b""))
+
+    def test_manifest_png_matches_exact_object_and_stored_bytes(self):
+        url = "https://objects.example.org/images/UI_Item_7.png"
+        with io.BytesIO() as output:
+            Image.new("RGB", (256, 256)).save(output, "PNG")
+            png = output.getvalue()
+        profile = SimpleNamespace(
+            **vars(self.profile),
+            PUBLISHED_IMAGE_DIGESTS={
+                url: (len(png), sha256(png).hexdigest(), 256, 256)
+            },
+        )
+        with patch(
+            "plugin_public_http.read_public_https",
+            return_value=(200, [("Content-Type", "image/png")], png),
+        ) as read:
+            self.assertEqual(fetch(url, MAX_FILE, profile)[2], png)
+            read.assert_called_once_with(
+                url, len(png), accept="image/png", skip_error_body=True
+            )
+            for other in (url.replace("7.png", "8.png"), url + "?v=1"):
+                with self.assertRaises(Unsupported):
+                    fetch(other, MAX_FILE, profile)
+            self.assertEqual(read.call_count, 1)
+        for media, body in (
+            ("image/png", png + b"x"),
+            ("image/png", png[:-1] + b"x"),
+            ("text/html", png),
+        ):
+            with (
+                self.subTest(media=media, length=len(body)),
+                patch(
+                    "plugin_public_http.read_public_https",
+                    return_value=(200, [("Content-Type", media)], body),
+                ),
+                self.assertRaises(Unsupported),
+            ):
+                fetch(url, MAX_FILE, profile)
+
+    def test_catalog_build_requires_source_id_and_ledger_digest(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "plugin.zip"
+            with ZipFile(snapshot, "w") as archive:
+                archive.writestr("icons.json", '{"item":"published item"}')
+            lock = {"snapshot_sha256": sha256(snapshot.read_bytes()).hexdigest()}
+            ledger = root / "ledger.json"
+            spec = {
+                "origin_directory": "https://publisher.example.org/icons",
+                "source_ids": "icons.json",
+                "ledger": ledger.name,
+            }
+            profile = {"published_images": spec}
+            record = [43, "8" * 64, 16, 16]
+            for key in ("item", "unknown"):
+                ledger.write_bytes(json.dumps({"objects": {key: record}}).encode())
+                spec["ledger_sha256"] = sha256(ledger.read_bytes()).hexdigest()
+                if key == "item":
+                    self.assertEqual(
+                        published_images(snapshot, lock, profile, root),
+                        {"https://publisher.example.org/icons/item.png": tuple(record)},
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        published_images(snapshot, lock, profile, root)
+            ledger.write_bytes(b"{}")
+            with self.assertRaisesRegex(ValueError, "checksums changed"):
+                published_images(snapshot, lock, profile, root)
 
     def test_source_manifest_uses_the_pinned_archive_and_actual_download_call(self):
         with TemporaryDirectory() as tmp:

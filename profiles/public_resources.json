@@ -1,5 +1,11 @@
 {
   "GenshinUID": {
+    "published_images": {
+      "source_ids": "GenshinUID/GenshinUID/utils/map/data/icon2Name_mapping_6.4.0.json",
+      "origin_directory": "https://upload-os-bbs.mihoyo.com/game_record/genshin/equip",
+      "ledger": "genshin-equipment-icons.json",
+      "ledger_sha256": "61c75a8300ccc124ac10b77c52b7b05dffb9e578f0eef048f77a5f34c3ccef43"
+    },
     "image_origins": [
       "https://act-webstatic.mihoyo.com",
       "https://enka.network",

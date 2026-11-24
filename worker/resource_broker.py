@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from http.client import IncompleteRead
+from hashlib import sha256
 from io import BytesIO
 import asyncio
 import itertools
@@ -140,6 +141,9 @@ def allowed(url, profile):
     for component in path.strip("/").split("/") if path != "/" else ():
         segment(unquote(component, errors="strict"))
     suffix = PurePosixPath(path).suffix.lower()
+    pinned = getattr(profile, "PUBLISHED_IMAGE_DIGESTS", {}).get(url)
+    if pinned is not None:
+        return "pinned_png", pinned[0]
     if profile.PACKAGE == "GenshinUID" and (kind := ambr_asset(url)):
         return kind, MAX_FILE
     if suffix in IMAGES:
@@ -188,6 +192,7 @@ def fetch(url, limit, profile, deadline=None):
         min(limit, ceiling),
         accept={
             "image": "image/*",
+            "pinned_png": "image/png",
             "index": "text/html",
             "exact_index": "text/html",
             "json": "application/json",
@@ -211,13 +216,30 @@ def fetch(url, limit, profile, deadline=None):
             if mime in ERROR_MEDIA_TYPES:
                 return status, [("Content-Type", mime)], data
         return status, [], b""
-    if kind == "image":
+    if kind == "pinned_png":
+        size, checksum, width, height = profile.PUBLISHED_IMAGE_DIGESTS[url]
+        content_types = [
+            v.strip().lower() for k, v in raw_headers if k.lower() == "content-type"
+        ]
+        if (
+            len(data) != size
+            or sha256(data).hexdigest() != checksum
+            or content_types != ["image/png"]
+        ):
+            raise Unsupported("published PNG differs from the sealed image catalog")
+    if kind in ("image", "pinned_png"):
         from PIL import Image
 
         try:
             with Image.open(
                 BytesIO(data), formats=("PNG", "JPEG", "WEBP", "GIF", "AVIF")
             ) as image:
+                if kind == "pinned_png" and (
+                    image.format != "PNG" or image.size != (width, height)
+                ):
+                    raise Unsupported(
+                        "published PNG differs from its catalog image profile"
+                    )
                 if image.width * image.height > 12_000_000:
                     raise Unsupported("published image exceeds the source pixel budget")
                 mime = Image.MIME[image.format]
