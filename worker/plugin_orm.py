@@ -15,7 +15,7 @@ import re
 import sqlite3
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 from sqlalchemy import Index, event
 from sqlalchemy.exc import DBAPIError
@@ -592,7 +592,7 @@ class PluginORM:
 def install_orm(package, data_root, plugin):
     global _runtime
     import plugin_orm_models as native
-    from plugin_account_models import GsCache, GsUser, GsUID
+    from plugin_account_models import GsBindFields, GsCache, GsUser, GsUID
     from plugin_core_user import CoreUser
 
     class Subscribe(native.BaseModel, table=True):
@@ -629,6 +629,8 @@ def install_orm(package, data_root, plugin):
     package("gsuid_core.utils.database.startup").exec_list = _runtime.migrations
     models = sys.modules["gsuid_core.utils.database.models"]
     models.GsUser, models.GsUID = GsUser, GsUID
+    models.GsBind.model_fields = MappingProxyType(GsBindFields.model_fields)
+    models.GsBind.__fields__ = models.GsBind.model_fields
     models.GsCache = GsCache
     models.Subscribe = Subscribe
     models.CoreUser = CoreUser

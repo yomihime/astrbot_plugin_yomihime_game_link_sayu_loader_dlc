@@ -59,22 +59,45 @@ def verified_cookie_input(reference):
             "522574b2f16dbe793c69c70d18acb20315b0c581020da8d14e0d8b036a36f56a",
         )
     )
-    service = next(
+    services = [
         node
         for node in login.body
         if isinstance(node, ast.Assign)
         and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id == "sv_core_user_addck"
-    )
+        and node.targets[0].id in ("sv_core_user_add", "sv_core_user_addck")
+    ]
     handlers = [
         node
         for node in login.body
         if isinstance(node, ast.AsyncFunctionDef)
-        and node.name in ("_send_help", "send_add_ck_msg")
+        and node.name in ("_send_help", "send_add_ck_msg", "send_refresh_ck_msg")
     ]
-    if len(handlers) != 2:
+    if len(services) != 2 or len(handlers) != 3:
         raise ValueError("native account intake handlers missing")
+    refresh_source = cookie.decode("utf-8")
+    refresh = {
+        node.name: ast.get_source_segment(refresh_source, node)
+        for node in ast.parse(refresh_source).body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name in ("get_ck_by_stoken", "refresh_ck_by_uid_list")
+    }
     return {
+        "plugin_cookie_manager/_native_refresh.py": (
+            GENERATED
+            + "from typing import Dict, Optional\n"
+            + "from gsuid_core.utils.database.models import GsUser\n"
+            + "from ._native_input import _deal_ck\n"
+            + refresh["refresh_ck_by_uid_list"]
+            + "\n"
+        ).encode("utf-8"),
+        "plugin_cookie_manager/_native_owner_refresh.py": (
+            GENERATED
+            + "from gsuid_core.utils.database.models import GsBind\n"
+            + "from gsuid_core.utils.error_reply import UID_HINT\n"
+            + "from .add_ck import refresh_ck_by_uid_list\n"
+            + refresh["get_ck_by_stoken"]
+            + "\n"
+        ).encode("utf-8"),
         "plugin_cookie_manager/_native_input.py": (
             GENERATED
             + """from http.cookies import SimpleCookie
@@ -97,8 +120,10 @@ from plugin_account_intake import intake_issuer as mys_api
 from gsuid_core.bot import Bot
 from gsuid_core.models import Event
 from gsuid_core.message_models import Button
-from gsuid_core.utils.cookie_manager.add_ck import deal_ck
+from gsuid_core.i18n import t as i18n_t
+from gsuid_core.logger import logger
+from gsuid_core.utils.cookie_manager.add_ck import deal_ck, get_ck_by_stoken
 """,
-            [service, *handlers],
+            [*services, *handlers],
         ),
     }

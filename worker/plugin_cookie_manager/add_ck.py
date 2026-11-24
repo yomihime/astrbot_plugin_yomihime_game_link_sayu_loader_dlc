@@ -134,3 +134,45 @@ async def deal_ck(bot_id, mes, user_id, mode="PIC"):
         raise Unsupported("credential-bearing status requires a trusted result projection")
     picture, count = await _deal_ck_to_pic(message)
     return (picture if mode == "PIC" else message), count
+
+
+async def get_ck_by_stoken(bot_id, user_id):
+    from plugin_account_intake import require_account_owner
+    from . import _native_owner_refresh
+
+    require_account_owner(bot_id, user_id)
+    return await _native_owner_refresh.get_ck_by_stoken(bot_id, user_id)
+
+
+async def refresh_ck_by_uid_list(bot_id, uid_dict, game_name=None):
+    from http.cookies import CookieError
+    from gsuid_core.utils.database.models import GsBind
+    from plugin_account_intake import require_account_owner
+    from plugin_bindings import _current
+    from port_errors import Unsupported
+    from . import _native_refresh
+
+    owner = _current.get()
+    require_account_owner(bot_id, owner.actor if owner else None)
+    # Snapshot before the first await. A batch with any foreign target must not
+    # process an earlier valid entry.
+    if type(uid_dict) is not dict:
+        raise Unsupported("refresh requires an explicit UID mapping")
+    targets = dict(uid_dict)
+    if any(
+        type(uid) is not str
+        or not uid.isascii()
+        or not uid.isdigit()
+        or type(actor) is not str
+        or actor != owner.actor
+        for uid, actor in targets.items()
+    ):
+        raise Unsupported("refresh targets must belong to the current account owner")
+    if targets:
+        bound = await GsBind.get_uid_list_by_game(owner.actor, bot_id, game_name)
+        if not targets.keys() <= set(bound or ()):
+            raise Unsupported("refresh targets must be bound to the current account owner")
+    try:
+        return await _native_refresh.refresh_ck_by_uid_list(bot_id, targets, game_name)
+    except CookieError:
+        raise Unsupported("invalid stored account input") from None
