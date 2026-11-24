@@ -97,19 +97,25 @@ def verified_orm_models(reference=None):
         for node in ast.parse(accounts).body
         if isinstance(node, ast.ClassDef) and node.name == "GsBind"
     )
+    # Use the pinned fields without inheriting unscoped ORM operations.
     fields = [
+        ast.get_source_segment(source, node)
+        for name in ("BaseIDModel", "BaseBotIDModel", "BaseModel", "Bind")
+        for node in nodes[name].body
+        if isinstance(node, ast.AnnAssign)
+    ] + [
         ast.get_source_segment(accounts, node)
         for node in binding.body
         if isinstance(node, ast.AnnAssign)
     ]
-    bind_fields = "class GsBindFields(Bind):\n" + "".join(
+    bind_fields = "class GsBindFields(SQLModel):\n" + "".join(
         "    " + field + "\n" for field in fields
     )
     account_models = (
         '"""Pinned gsuid_core account declarations. GPL-3.0, see licenses/gsuid_core-COPYING.txt."""\n'
-        "from typing import Optional\nfrom sqlmodel import Field, select, update, or_\n"
+        "from typing import Optional\nfrom sqlmodel import SQLModel, Field, select, update, or_\n"
         "from sqlalchemy.ext.asyncio import AsyncSession\n"
-        "from plugin_orm import with_session\nfrom plugin_orm_models import BaseIDModel, Bind, Cache, User\n\n"
+        "from plugin_orm import with_session\nfrom plugin_orm_models import BaseIDModel, Cache, User\n\n"
         + bind_fields
         + "\n\n"
         + "\n\n".join(declarations)

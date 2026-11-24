@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import sqlite3
-from types import SimpleNamespace
+from typing import ClassVar
 
 
 @dataclass
@@ -126,6 +126,12 @@ def _uid_list(model, user_id, bot_id, game_name, *, new_group=None):
 
 
 class GsBind:
+    @classmethod
+    def _from_storage(cls, values):
+        row = cls()
+        vars(row).update(values)
+        return row
+
     @staticmethod
     def get_gameid_name(game_name=None):
         column = "uid" if not game_name or game_name == "gs" else f"{game_name}_uid"
@@ -140,9 +146,11 @@ class GsBind:
             bot_id = owner.adapter
         with _transaction(cls, user_id, bot_id) as db:
             row = db.execute(
-                "SELECT * FROM bindings WHERE user_id=? AND bot_id=?", (user_id, bot_id)
+                "SELECT rowid AS id, user_id, bot_id, group_id, uid, sr_uid, bb_uid, "
+                "bbb_uid, zzz_uid, wd_uid FROM bindings WHERE user_id=? AND bot_id=?",
+                (user_id, bot_id),
             ).fetchone()
-            return SimpleNamespace(**dict(row)) if row else None
+            return cls._from_storage(dict(row)) if row else None
 
     @classmethod
     async def bind_exists(cls, user_id, bot_id):
@@ -254,8 +262,26 @@ class GsBind:
 
 
 def install(package, data_root):
-    class ProfileBindings(GsBind):
-        path = Path(data_root) / "bindings.sqlite3"
+    from plugin_account_models import GsBindFields
+    from sqlalchemy.orm import make_transient_to_detached, registry
+
+    # The legacy bindings file has a composite primary key. Keep its row model
+    # outside the ORM's schema migrations while retaining SQLModel semantics.
+    class BindingSchema(GsBindFields, registry=registry()):
+        pass
+
+    class ProfileBindings(GsBind, BindingSchema, table=True):
+        __tablename__ = "gsbind"
+        path: ClassVar[Path] = Path(data_root) / "bindings.sqlite3"
+
+        @classmethod
+        def _from_storage(cls, values):
+            # SQLAlchemy materializes loaded rows without marking fields as
+            # explicitly supplied by a caller.
+            row = cls(**values)
+            row.model_fields_set.clear()
+            make_transient_to_detached(row)
+            return row
 
     package("gsuid_core.utils.database")
     package("gsuid_core.utils.database.models").GsBind = ProfileBindings

@@ -71,8 +71,11 @@ class ProfileInventory:
             )
         result = []
         for values in self._read_rows(table):
-            row = model()
-            vars(row).update(deepcopy(values))
+            if issubclass(model, plugin_bindings.GsBind):
+                row = model._from_storage(deepcopy(values))
+            else:
+                row = model()
+                vars(row).update(deepcopy(values))
             result.append(row)
         return result
 
@@ -86,7 +89,7 @@ def install_enumeration(models, *, admins=(), read_rows=None):
     global _installed
     authority = ProfileInventory(admins, read_rows)
 
-    class ProfileBind(models.GsBind):
+    class BindingQueries:
         @classmethod
         async def get_all_data(cls):
             return authority.rows("bindings", cls)
@@ -156,16 +159,13 @@ def install_enumeration(models, *, admins=(), read_rows=None):
 
     # SQLAlchemy must keep the original mapped class for row hydration and column
     # expressions. Only replace its profile-wide queries with the admin port.
-    if hasattr(models.GsUser, "__table__"):
-        for name, method in vars(InventoryQueries).items():
-            if isinstance(method, classmethod):
-                setattr(models.GsUser, name, method)
-    else:
-
-        class ProfileUser(InventoryQueries, models.GsUser):
-            pass
-
-        models.GsUser = ProfileUser
-    models.GsBind = ProfileBind
+    for name, queries in (("GsBind", BindingQueries), ("GsUser", InventoryQueries)):
+        model = getattr(models, name)
+        if hasattr(model, "__table__"):
+            for method_name, method in vars(queries).items():
+                if isinstance(method, classmethod):
+                    setattr(model, method_name, method)
+        else:
+            setattr(models, name, type(name, (queries, model), {}))
     _installed = authority._generation
     return authority

@@ -222,6 +222,19 @@ async def probe(mode, phase, worker):
         result["sr_value"] = await GsBind.get_uid_by_game(ACTOR, BOT, "sr")
         result["group"] = (await GsBind.select_data(ACTOR, BOT)).group_id
         result["implicit_adapter"] = (await GsBind.select_data(ACTOR)).group_id
+        row = await GsBind.select_data(ACTOR, BOT)
+        assert isinstance(row, GsBind)
+        result["materialized_row"] = row.model_dump()
+        result["explicit_fields"] = sorted(row.model_fields_set)
+        assert json.loads(row.model_dump_json()) == result["materialized_row"]
+        from sqlalchemy import inspect
+
+        result["detached"] = inspect(row).detached
+        result["row_identity"] = list(inspect(row).identity)
+        result["table_columns"] = list(GsBind.__table__.columns.keys())
+        result["constructed_empty"] = GsBind().model_dump()
+        row.group_id = "local change"
+        assert (await GsBind.select_data(ACTOR, BOT)).group_id == result["group"]
         result["exists"] = await GsBind.bind_exists(ACTOR, BOT)
         result["first_group"] = await GsBind.get_bind_group(ACTOR, BOT)
         result["groups"] = await GsBind.get_bind_group_list(ACTOR, BOT)

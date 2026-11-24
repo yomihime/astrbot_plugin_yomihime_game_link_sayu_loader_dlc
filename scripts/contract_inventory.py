@@ -173,6 +173,11 @@ def proof_index():
             "utils.api.mys.api.ApiEndpoint.get",
         ],
         "mys_read_error_contract": ["utils.api.mys.base_request.BaseMysApi._mys_request"],
+        "account_refresh_contract": [
+            "utils.cookie_manager.add_ck.get_ck_by_stoken",
+            "utils.cookie_manager.add_ck.refresh_ck_by_uid_list",
+            "buildin_plugins.core_command.user_login.send_refresh_ck_msg",
+        ],
         "upstream_account_contract": [
             "buildin_plugins.core_command.user_login.send_add_ck_msg",
         ],
@@ -280,6 +285,7 @@ def proof_index():
             "trigger.registry_version",
         ],
         "binding_contract": [
+            "utils.database.models.GsBind",
             "utils.database.api.get_uid",
             "utils.api.mys.base_request.BaseMysApi.get_overseas_device_id",
             "utils.api.mys.base_request.BaseMysApi.get_overseas_device_fp",
@@ -348,6 +354,7 @@ PROBE_LIMITS = {
     "image_tools": "Compared fixed drawing inputs, pixels and exceptions. Inputs and rendered surfaces are bounded.",
     "mys_account": "Isolated credentials and controlled HTTP. No production login, signing issuer or service acceptance.",
     "mys_read_error": "Owner's read-only GET, connection refusal, malformed response, ordered messages, and no-Bot failure. Uncertain requests are not replayed.",
+    "account_refresh": "Original owner handler, checked target lists, missing and malformed credentials, persisted rows and reopening. A valid Stoken still needs an external issuer.",
     "account_enumeration": "Compared raw lists with a private administrator grant. Ordinary production chat cannot enumerate.",
     "upstream_account": "Original chat callback on synthetic inputs and isolated storage. External session issuance and signed game reads remain unavailable on the Loader.",
     "mys_cache": "Compared cache inputs and response behavior in isolated processes.",
