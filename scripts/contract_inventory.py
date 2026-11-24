@@ -170,6 +170,9 @@ def proof_index():
             "utils.api.mys.api.ApiEndpoint.get",
         ],
         "mys_read_error_contract": ["utils.api.mys.base_request.BaseMysApi._mys_request"],
+        "upstream_account_contract": [
+            "buildin_plugins.core_command.user_login.send_add_ck_msg",
+        ],
         "cache_contract": [
             "utils.database.models.GsCache",
             *(
@@ -282,9 +285,10 @@ def proof_index():
                 for name in (
                     "get_account_id", "get_cookie_value", "serialize_cookie",
                     "get_persist_cookie_data", "is_overseas_account", "get_all_bind_uid",
-                    "draw_add_ck_pic", "_deal_ck_to_pic",
+                    "deal_ck", "draw_add_ck_pic", "_deal_ck_to_pic",
                 )
             ),
+            *("utils.database.utils." + name for name in ("SERVER", "SR_SERVER", "ZZZ_SERVER")),
             "utils.image.image_tools.get_status_icon",
             "utils.image.image_tools.get_v4_bg",
             *(
@@ -342,6 +346,7 @@ PROBE_LIMITS = {
     "mys_account": "Isolated credentials and controlled HTTP. No production login, signing issuer or service acceptance.",
     "mys_read_error": "Owner's read-only GET, connection refusal, malformed response, ordered messages, and no-Bot failure. Uncertain requests are not replayed.",
     "account_enumeration": "Compared raw lists with a private administrator grant. Ordinary production chat cannot enumerate.",
+    "upstream_account": "Original chat callback on synthetic inputs and isolated storage. External session issuance and signed game reads remain unavailable on the Loader.",
     "mys_cache": "Compared cache inputs and response behavior in isolated processes.",
     "mys_models": "Compared pinned model definitions and public endpoint values and regions. A declaration does not authorize network access.",
     "subscribe": "Compared role-scoped records. End-to-end scheduled external delivery requires a target grant.",

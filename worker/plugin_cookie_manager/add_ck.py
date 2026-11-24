@@ -115,3 +115,22 @@ async def _deal_ck_to_pic(im):
 
     card, count = await draw_add_ck_pic(im)
     return await convert_img(card), count
+
+
+async def deal_ck(bot_id, mes, user_id, mode="PIC"):
+    """Perform native local validation in the current owner's account invocation."""
+    from http.cookies import CookieError
+    from plugin_account_intake import require_account_owner
+    from port_errors import Unsupported
+    from ._native_input import _deal_ck, PUBLIC_ERRORS
+
+    require_account_owner(bot_id, user_id)
+    try:
+        message = await _deal_ck(bot_id, mes, user_id)
+    except CookieError:
+        # SimpleCookie can embed arbitrary caller input in its exception text.
+        raise Unsupported("invalid account input") from None
+    if message not in PUBLIC_ERRORS:
+        raise Unsupported("credential-bearing status requires a trusted result projection")
+    picture, count = await _deal_ck_to_pic(message)
+    return (picture if mode == "PIC" else message), count

@@ -824,6 +824,8 @@ class MysApi(BaseMysApi):
 
 
 def install_mys(package):
+    regions = package("gsuid_core.utils.database.utils")
+    regions.SERVER, regions.SR_SERVER, regions.ZZZ_SERVER = SERVER, SR_SERVER, ZZZ_SERVER
     prefix = "gsuid_core.utils.api.mys"
     api = package(prefix)
     # This directory contains the pinned type and endpoint declarations.
@@ -850,6 +852,7 @@ def install_mys(package):
     base = package(prefix + ".base_request")
     base.BaseMysApi = BaseMysApi
     base.RECOGNIZE_SERVER = SERVER
+    base.SR_SERVER, base.ZZZ_SERVER = SR_SERVER, ZZZ_SERVER
     package(prefix + ".request").MysApi = MysApi
     signing = package(prefix + ".tools")
     signing.mys_version = BaseMysApi.mysVersion

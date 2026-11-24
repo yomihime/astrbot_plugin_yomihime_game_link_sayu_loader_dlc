@@ -111,6 +111,10 @@ def send(output, message):
 
 
 def error_code(exc):
+    from plugin_account_intake import IssuerUnavailable
+
+    if isinstance(exc, IssuerUnavailable):
+        return "account_issuer_unavailable"
     if isinstance(exc, sayu_compat.NoMatch):
         return "no_match"
     if isinstance(exc, sayu_compat.UnsupportedMessage):

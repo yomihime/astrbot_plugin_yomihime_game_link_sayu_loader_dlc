@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 from environments import selected
+from cookie_input_assets import verified_cookie_input
 from image_assets import verified_assets
 from help_assets import verified_help
 from locale_assets import verified_locales
@@ -67,6 +68,7 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
     files[MYS_API_PATH] = endpoint_source
     license_path = "licenses/gsuid_core-COPYING.txt"
     files.update(verified_assets(LOCAL / "reference"))
+    files.update(verified_cookie_input(LOCAL / "reference"))
     files.update(verified_help(LOCAL / "reference"))
     files.update(verified_locales(LOCAL / "reference"))
     files.update(verified_orm_models(LOCAL / "reference"))

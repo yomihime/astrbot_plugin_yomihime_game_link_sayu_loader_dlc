@@ -389,6 +389,10 @@ def text_blocks(parts, subject):
 
 ERRORS = {
     "no_match": (ygl.ErrorCode.NOT_FOUND, "未匹配到当前已加载的上游指令。"),
+    "account_issuer_unavailable": (
+        ygl.ErrorCode.UNSUPPORTED,
+        "此账号操作需要受信宿主完成凭据验证，当前未接入。",
+    ),
     "missing_port": (ygl.ErrorCode.UNSUPPORTED, "此上游功能需要尚未接入的接口或依赖。"),
     "unsupported_message": (
         ygl.ErrorCode.UNSUPPORTED,

@@ -116,6 +116,10 @@ class PluginRuntime:
         self.plugin = plugin
         self.shutdown_pools = shutdown_pools
         sys.modules["gsuid_core.utils.error_reply"] = plugin_errors
+        from plugin_account_intake import install_account_services
+        from sayu_compat import private_service_registration
+
+        install_account_services(package, private_service_registration)
         package("plugins", source)
         server = package("gsuid_core.server")
         self.meta = install_meta(package("gsuid_core.meta_plugins"), server, plugin)

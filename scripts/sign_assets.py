@@ -20,7 +20,7 @@ mys_api = SignMysApi()
 """
 
 
-def _source(reference, name, digest):
+def verified_source(reference, name, digest):
     if reference is not None and Path(reference).is_dir():
         stream = (Path(reference) / name).open("rb")
     else:
@@ -28,8 +28,12 @@ def _source(reference, name, digest):
     with stream:
         data = stream.read(120_000)
     if sha256(data).hexdigest() != digest:
-        raise ValueError("native sign source checksum mismatch")
-    return ast.parse(data)
+        raise ValueError(f"native source checksum mismatch: {name}")
+    return data
+
+
+def _source(reference, name, digest):
+    return ast.parse(verified_source(reference, name, digest))
 
 
 def _assignments(nodes, names):

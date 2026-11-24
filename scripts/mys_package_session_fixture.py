@@ -172,6 +172,7 @@ def verify(profile, native, loader, stored, spec, reference):
         ]
     )
     assert list(left) == list(right) == keys
+    intake_registered = not stored and bool(right["invalid_cookie"]["executed_handlers"])
     allowed = {"status"} if stored else {"status", "cookie"}
     for side in (left, right):
         bound = issued = False
@@ -202,7 +203,10 @@ def verify(profile, native, loader, stored, spec, reference):
                 "status": f"plugins.{package}.{package}.{module}.send_daily_info",
                 "other_status": f"plugins.{package}.{package}.{module}.send_daily_info",
             }[name]
-            if side is right and name in ("qr_without_uid", "invalid_cookie", "cookie"):
+            if side is right and (
+                name == "qr_without_uid"
+                or (not intake_registered and name in ("invalid_cookie", "cookie"))
+            ):
                 assert row["executed_handlers"] == []
             else:
                 assert row["executed_handlers"] == [registration], (
@@ -257,10 +261,21 @@ def verify(profile, native, loader, stored, spec, reference):
         assert left["cookie"]["http_details"] == [
             request_record("/game_record/card/wapi/getGameRecordCard")
         ]
-        for name in ("cookie", "invalid_cookie", "qr_without_uid"):
-            assert right[name]["error"] == "NoMatch"
+        assert right["qr_without_uid"]["error"] == "NoMatch"
         assert "还没有绑定过Cookie" in str(right["status"]["parts"])
-        verdict = "core_cookie_issuer_not_registered"
+        if intake_registered:
+            (card,) = right["invalid_cookie"]["parts"]
+            assert set(card) == {"image_bytes", "sha256"} and card["image_bytes"] > 0
+            assert right["cookie"]["error"] == "IssuerUnavailable"
+            assert (
+                right["cookie"]["detail"] == "account intake requires a trusted host issuer"
+            )
+            assert not right["cookie"].get("parts")
+            verdict = "local_cookie_validation_only_issuer_unavailable"
+        else:
+            for name in ("cookie", "invalid_cookie"):
+                assert right[name]["error"] == "NoMatch"
+            verdict = "core_cookie_issuer_not_registered"
     return {
         "profile": profile,
         "status": verdict,

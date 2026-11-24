@@ -20,8 +20,19 @@ BOT = "fixture-adapter"
 
 
 async def account_input_probe():
-    from gsuid_core.utils.api.mys.base_request import BaseMysApi
+    from gsuid_core.utils.api.mys import base_request
     from gsuid_core.utils.cookie_manager import add_ck
+    from gsuid_core.utils.database import utils as db_regions
+
+    BaseMysApi = base_request.BaseMysApi
+    assert db_regions.SERVER is base_request.RECOGNIZE_SERVER
+    assert db_regions.SERVER is BaseMysApi.RECOGNIZE_SERVER
+    assert db_regions.SR_SERVER is base_request.SR_SERVER
+    assert db_regions.ZZZ_SERVER is base_request.ZZZ_SERVER
+    region_fields = {
+        name: list(getattr(db_regions, name).items())
+        for name in ("SERVER", "SR_SERVER", "ZZZ_SERVER")
+    }
 
     cases = [
         "",
@@ -89,7 +100,12 @@ async def account_input_probe():
         )
         for actor in (42, "42", "0042", "", "测试")
     ]
-    return {"cookies": cookies, "regions": regions, "devices": devices}
+    return {
+        "cookies": cookies,
+        "regions": regions,
+        "region_fields": region_fields,
+        "devices": devices,
+    }
 
 
 async def account_status_cards():
@@ -124,6 +140,19 @@ async def account_status_cards():
     return {"backgrounds": backgrounds, "icons": icons, "cards": cards}
 
 
+async def enrollment_without_exchange(inputs):
+    from gsuid_core.utils.cookie_manager.add_ck import deal_ck
+
+    receipt = []
+    for value in inputs:
+        text, status = await deal_ck(BOT, value, ACTOR, "TEXT")
+        card, picture_status = await deal_ck(BOT, value, ACTOR)
+        assert status == picture_status == 0
+        assert "fixture-enroll" not in text
+        receipt.append((text, status, hashlib.sha256(card).hexdigest()))
+    return receipt
+
+
 async def probe(mode, phase, worker):
     from native_contract import offline
 
@@ -138,7 +167,7 @@ async def probe(mode, phase, worker):
         data.mkdir(exist_ok=True)
         sayu_compat.install("Example", "ex", data, source_root=Path.cwd())
         PluginRuntime(data).install(Path.cwd(), "Example")
-        scope = binding_scope(ACTOR, BOT, True, writable=True)
+        scope = binding_scope(ACTOR, BOT, True, writable=True, account_records=True)
     else:
         sys.path.insert(0, str(Path.cwd()))
         from gsuid_core.utils.database import base_models
@@ -158,6 +187,9 @@ async def probe(mode, phase, worker):
         result["roles_before"] = await get_all_bind_uid(BOT, ACTOR)
         if phase == "write":
             result["status_cards"] = await account_status_cards()
+            result["no_binding_intake"] = await enrollment_without_exchange(
+                ["account_id=42;cookie_token=fixture-enroll"]
+            )
             result["insert"] = [
                 await GsBind.insert_uid(ACTOR, BOT, value, "room", 9)
                 for value in ["0", "notnumber", "000000001", "000000002", "000000001"]
@@ -167,6 +199,13 @@ async def probe(mode, phase, worker):
             )
             for game, uid in (("zzz", "000000005"), ("bbb", "000000006")):
                 await GsBind.insert_uid(ACTOR, BOT, uid, "room", 9, game_name=game)
+            result["invalid_intake"] = await enrollment_without_exchange([
+                "other=fixture-enroll",
+                "stoken=fixture-enroll",
+                "login_ticket=fixture-enroll",
+                "cookie_token=fixture-enroll",
+                "account_id=42;stoken=v2_fixture-enroll",
+            ])
             result["switch_missing"] = await GsBind.switch_uid_by_game(
                 ACTOR, BOT, "000000004"
             )

@@ -54,6 +54,7 @@ class NoMatch(LookupError):
 
 
 _routes = []
+_account_routes = []
 _plugin_settings = {}
 _services = {}
 _service_store = None
@@ -88,12 +89,29 @@ def registration_scope():
         raise
 
 
+@contextmanager
+def private_service_registration(plugin):
+    """Collect a built-in's native decorators under its own package settings."""
+    global _routes, _plugin_settings, _plugin, _service_store
+    original = _routes, _plugin_settings, _plugin, _service_store
+    _routes, _plugin_settings, _plugin, _service_store = [], {}, plugin, None
+    try:
+        yield
+        _account_routes[:] = [
+            route for route in _account_routes if route.sv.self_plugin_name != plugin
+        ]
+        _account_routes.extend(_routes)
+    finally:
+        _routes, _plugin_settings, _plugin, _service_store = original
+
+
 def registration_counts():
     """Counts of distinct services and handlers, including multiple aliases per handler."""
+    routes = [*_routes, *_account_routes]
     return {
-        "services": len({id(route.sv) for route in _routes}),
-        "handlers": len({route.func for route in _routes}),
-        "triggers": len(_routes),
+        "services": len({id(route.sv) for route in routes}),
+        "handlers": len({route.func for route in routes}),
+        "triggers": len(routes),
     }
 
 
@@ -108,7 +126,7 @@ def registered_triggers():
             "prefix": bool(route.prefix),
             "area": route.sv.area,
         }
-        for route in _routes
+        for route in (*_routes, *_account_routes)
     ]
 
 
@@ -889,6 +907,7 @@ def flush_loaded_service_settings():
 def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
     global _plugin, _prefix, _data_root, _source, _service_store
     _routes.clear()
+    _account_routes.clear()
     _adapter_frames.clear()
     _adapter_counts.clear()
     _plugin_settings.clear()
@@ -1063,7 +1082,17 @@ async def dispatch(
 
 async def dispatch_event(incoming, *, mapped):
     """Dispatch a decoded adapter event. Only trusted adapter inputs can supply roles."""
-    matched = [route for route in _routes if _match(route, incoming, mapped)]
+    routes = _routes
+    private = [route for route in _account_routes if route.check_command(incoming)]
+    if private:
+        # Never send a reserved account input to a game's generic message listeners.
+        from plugin_account_intake import require_account_owner
+
+        if incoming.user_type != "direct" or incoming.group_id:
+            raise Unsupported("account intake requires a private conversation")
+        require_account_owner(incoming.bot_id, incoming.user_id)
+        routes = private
+    matched = [route for route in routes if _match(route, incoming, mapped)]
     listeners = [route for route in matched if route.type == "message"]
     commands = sorted(
         (route for route in matched if route.type != "message"),
