@@ -3,6 +3,7 @@
 import base64
 import binascii
 import asyncio
+import inspect
 import sys
 import uuid
 from collections import Counter, deque
@@ -646,6 +647,24 @@ def worker_font(source, package_name, size):
     raise UnsupportedMessage("no CJK font available")
 
 
+def call_bot():
+    """Find the nearest Bot argument on this call stack, as in gsuid_core.bot."""
+    frame = sys._getframe(1)
+    try:
+        while frame is not None:
+            arguments = inspect.getargvalues(frame)
+            for name in arguments.args:
+                value = arguments.locals[name]
+                if isinstance(value, Bot):
+                    return value
+            frame = frame.f_back
+    finally:
+        del frame
+    from gsuid_core.i18n import t
+
+    raise ValueError(t("[GsCore] 当前Session中未找到可用Bot实例..."))
+
+
 class Bot:
     get_lang = bot_get_lang
     t = bot_t
@@ -919,6 +938,7 @@ def install(plugin, prefix, data_root, *, source_root=None, runtime_mode=None):
 
     bot = package("gsuid_core.bot")
     bot.Bot = Bot
+    bot.call_bot = call_bot
     bot.msgjson = msgjson
     models = package("gsuid_core.models")
     models.Event = Event
@@ -1023,21 +1043,22 @@ async def dispatch(
 ):
     if conversation_kind == "group" and not group_id:
         group_id = conversation_id
-    return await dispatch_event(
-        Event(
-            text=text,
-            raw_text=text,
-            content=[Message("text", text)],
-            user_id=actor_id,
-            group_id=group_id,
-            user_type="group" if group_id else conversation_kind,
-            msg_id=message_id,
-            bot_id=adapter_id,
-            real_bot_id=adapter_id,
-            WS_BOT_ID="",
-        ),
-        mapped=False,
+    from plugin_inbound import EventResources, msg_process
+
+    message = MessageReceive(
+        user_id=actor_id,
+        group_id=group_id,
+        user_type="group" if group_id else conversation_kind,
+        msg_id=message_id,
+        bot_id=adapter_id,
+        content=[Message("text", text)],
     )
+    incoming = msg_process(message, EventResources())
+    # An SDK adapter is an opaque owner-binding identity, including any colon.
+    # It supplies no native websocket or adapter-instance identity.
+    incoming.bot_id = adapter_id
+    incoming.WS_BOT_ID = ""
+    return await dispatch_event(incoming, mapped=False)
 
 
 async def dispatch_event(incoming, *, mapped):

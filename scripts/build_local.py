@@ -22,6 +22,8 @@ from scheduler_assets import verified_scheduler
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".sayu-local"
+MYS_API_PATH = "plugin_mys_schema/api.py"
+MYS_API_SHA256 = "d3c3d0544f18da993eedae0182aea4e9476024d929831558f0f6223cb2cc9887"
 
 
 def digest(data):
@@ -57,6 +59,12 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
         for path in worker.rglob("*.py")
         if path.stem not in probe_modules
     }
+    # The public endpoint table is part of the native plugin API. Verify the
+    # pinned source and normalize checkout line endings before sealing the pyz.
+    endpoint_source = files[MYS_API_PATH].replace(b"\r\n", b"\n")
+    if digest(endpoint_source) != MYS_API_SHA256:
+        raise ValueError("pinned native endpoint declarations differ")
+    files[MYS_API_PATH] = endpoint_source
     license_path = "licenses/gsuid_core-COPYING.txt"
     files.update(verified_assets(LOCAL / "reference"))
     files.update(verified_help(LOCAL / "reference"))

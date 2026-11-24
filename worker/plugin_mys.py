@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from importlib import import_module
 import json
 from pathlib import Path
+from random import choice
 import sys
 import time
 from typing import Callable
@@ -93,27 +94,9 @@ ENDPOINTS = {
         ("GCG_DECK", "gcg/deckList"),
     )
 }
-PUBLIC_ENDPOINT_DECLARATIONS = {
-    "GET_GACHA_LOG": ApiEndpoint(
-        "https://public-operation-hk4e.mihoyo.com/gacha_info/api/getGachaLog",
-        "https://public-operation-hk4e-sg.hoyoverse.com/gacha_info/api/getGachaLog",
-        "GET_GACHA_LOG",
-    ),
-    **{
-        name: ApiEndpoint(cn=BBS_URL + suffix, name=name)
-        for name, suffix in (
-            ("BBS_TASKS", "/apihub/sapi/getUserMissionsState"),
-            ("BBS_SIGN", "/apihub/app/api/signIn"),
-            (
-                "BBS_LIST",
-                "/post/api/getForumPostList?forum_id={}&is_good=false&is_hot=false&page_size=20&sort_type=1",
-            ),
-            ("BBS_DETAIL", "/post/api/getPostFull?post_id={}"),
-            ("BBS_COLLECTION", "/post/wapi/getPostFullInCollection"),
-            ("BBS_SHARE", "/apihub/api/getShareConf?entity_id={}&entity_type=1"),
-            ("BBS_LIKE", "/apihub/sapi/upvotePost"),
-        )
-    },
+PUBLIC_BBS_READ_ROUTES = {
+    "BBS_DETAIL": BBS_URL + "/post/api/getPostFull",
+    "BBS_COLLECTION": BBS_URL + "/post/wapi/getPostFullInCollection",
 }
 READ_ROUTES = {
     url: (game, is_os)
@@ -274,6 +257,10 @@ class BaseMysApi:
     async def get_uid(self, uid, game_name=None):
         models = _owner_models()
         if models is not None:
+            # Unset alias columns are SQL NULL; looking up None could select
+            # an arbitrary role instead of proving the caller named a role.
+            if type(uid) is not int and (not isinstance(uid, str) or not uid.strip()):
+                raise ValueError("account queries require a role ID")
             return await models.GsUID.get_main_uid(uid, game_name)
         return uid
 
@@ -283,12 +270,34 @@ class BaseMysApi:
         models = _owner_models()
         if models is not None:
             uid = await self.get_uid(uid, game_name)
-            # A random credential from another account is outside this invocation.
-            if mode == "RANDOM" and not await models.GsUser.cookie_validate(
-                uid, game_name
-            ):
+            row = await models.GsUser.select_data_by_uid(uid, game_name)
+            if row is None:
                 return None
-            return await models.GsUser.get_user_cookie_by_uid(uid, game_name)
+            if mode == "OWNER" or not row.status:
+                return row.cookie
+            # A fallback is only for a known role in this actor/adapter database.
+            # Never consult the global cache or administrator inventory.
+            owner = plugin_bindings._current.get()
+            rows = await models.GsUser.select_data_list(owner.actor, owner.adapter)
+            if game_name in ("gs", "sr") or (game_name == "zzz" and len(uid) >= 10):
+                region = self.get_server_id(uid, game_name)
+                column = "region" if game_name == "gs" else f"{game_name}_region"
+                eligible = [
+                    item.cookie
+                    for item in rows or ()
+                    if not item.status
+                    and item.cookie
+                    and getattr(item, column) == region
+                ]
+                return choice(eligible) if eligible else None
+            return next(
+                (
+                    item.cookie
+                    for item in rows or ()
+                    if item.status is None and item.cookie
+                ),
+                None,
+            )
         return await GsUser.get_user_cookie_by_uid(uid, game_name)
 
     async def get_stoken(self, uid, game_name=None):
@@ -539,33 +548,139 @@ class BaseMysApi:
         params = {
             k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()
         }
-        raw = await _read_response(url, headers, params, timeout)
-        if account is not _account(account.uid, game):
-            return -51
-        return _decode_response(raw)
+        for _ in range(2):
+            if account is not _account(account.uid, game):
+                return -51
+            try:
+                complete_json, raw = await _read_response(
+                    url, headers, params, timeout, owner=True
+                )
+            except _ConnectionNotEstablished:
+                message = "[mys_request] 请求连接错误..."
+                fields = {}
+            else:
+                if account is not _account(account.uid, game):
+                    return -51
+                if complete_json:
+                    raw = (
+                        raw.strip()
+                    )  # aiohttp.ClientResponse.json strips the wire body
+                    if not raw:
+                        raise ValueError("empty account API response")
+                try:
+                    return _decode_response(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    if not complete_json:
+                        raise ValueError("invalid account error response") from None
+                    # A completed body failed local JSON parsing. Only disclose
+                    # parser coordinates and reviewed constant diagnostics.
+                    detail = "invalid JSON response"
+                    if isinstance(exc, json.JSONDecodeError) and exc.msg in (
+                        "Expecting value",
+                        "Expecting property name enclosed in double quotes",
+                        "Expecting ':' delimiter",
+                        "Expecting ',' delimiter",
+                        "Extra data",
+                        "Unterminated string starting at",
+                    ):
+                        detail = f"{exc.msg}: line {exc.lineno} column {exc.colno} (char {exc.pos})"
+                    message = (
+                        "[mys_request] 请求错误, 请联系Bot主人检查控制台! 错误信息: {e}"
+                    )
+                    fields = {"e": detail}
+            if account is not _account(account.uid, game):
+                return -51
+            from gsuid_core.bot import call_bot
+
+            bot = call_bot()
+            await bot.send(await bot.t(message, **fields))
+        return -999
 
 
-async def _read_response(url, headers, params, timeout=300):
-    from httpx2 import AsyncClient
+class _ConnectionNotEstablished(Exception):
+    """The transport could not resolve or connect before sending the GET."""
+
+
+def _known_unconnected(exc):
+    import errno
+    import socket
+
+    # Only a concrete pre-connect OS cause is sufficient. A bare client error,
+    # policy rejection, TLS failure or timeout gives us no retry authority.
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (ConnectionRefusedError, socket.gaierror)) or (
+            type(exc) is OSError
+            and exc.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH)
+        ):
+            return True
+        if isinstance(exc, (PermissionError, TimeoutError)):
+            break
+        exc = exc.__cause__
+    return False
+
+
+async def _read_response(url, headers, params, timeout=300, *, owner=False):
+    from httpx2 import AsyncClient, ConnectError, TransportError
 
     async with AsyncClient(
         follow_redirects=False, trust_env=False, timeout=timeout
     ) as client:
-        async with client.stream(
-            "GET", url, headers=headers, params=params
-        ) as response:
-            raw = bytearray()
-            async for part in response.aiter_bytes(chunk_size=65536):
-                if len(raw) + len(part) > 8 * 1024 * 1024:
-                    raise ValueError("account API response exceeds size limit")
-                raw.extend(part)
-    return raw
+        received_headers = False
+        try:
+            async with client.stream(
+                "GET", url, headers=headers, params=params
+            ) as response:
+                received_headers = True
+                media = (
+                    response.headers.get("Content-Type", "")
+                    .partition(";")[0]
+                    .strip()
+                    .lower()
+                )
+                complete_json = (
+                    response.status_code == 200
+                    and "Content-Range" not in response.headers
+                    and (
+                        media == "application/json"
+                        or (
+                            media.startswith("application/") and media.endswith("+json")
+                        )
+                    )
+                    and (response.encoding or "utf-8").lower() in ("utf-8", "utf8")
+                )
+                raw = bytearray()
+                async for part in response.aiter_bytes(chunk_size=65536):
+                    if len(raw) + len(part) > 8 * 1024 * 1024:
+                        raise ValueError("account API response exceeds size limit")
+                    raw.extend(part)
+        except TransportError as exc:
+            if not owner:
+                raise
+            if (
+                isinstance(exc, ConnectError)
+                and not received_headers
+                and _known_unconnected(exc)
+            ):
+                raise _ConnectionNotEstablished from None
+            raise type(exc)("account transport unavailable") from None
+        except (PermissionError, TimeoutError) as exc:
+            if not owner:
+                raise
+            raise type(exc)("account transport unavailable") from None
+    return (complete_json, raw) if owner else raw
 
 
 def _decode_response(raw):
     result = json.loads(raw)
-    code = result.get("retcode", result.get("code", 0))
-    return code if code else result
+    if "retcode" in result:
+        code = result["retcode"]
+    elif "code" in result:
+        code = result["code"]
+    else:
+        return result
+    return result if code == 0 else code
 
 
 class MysApi(BaseMysApi):
@@ -574,7 +689,7 @@ class MysApi(BaseMysApi):
     async def _public_bbs(self, name, params):
         if not self._authorize_public_bbs:
             raise NotImplementedError("public BBS web signature issuer unavailable")
-        url = PUBLIC_ENDPOINT_DECLARATIONS[name].get().split("?")[0]
+        url = PUBLIC_BBS_READ_ROUTES[name]
         signature = self._authorize_public_bbs("GET", url, dict(params))
         if not isinstance(signature, str) or not signature:
             raise PermissionError("public BBS signature unavailable")
@@ -645,7 +760,7 @@ class MysApi(BaseMysApi):
 def install_mys(package):
     prefix = "gsuid_core.utils.api.mys"
     api = package(prefix)
-    # Only the 23 native type declaration modules live in this search path.
+    # This directory contains the pinned type and endpoint declarations.
     # Genshin-bots/gsuid_core 96cd7353, GPL-3.0 (licenses/gsuid_core-COPYING.txt).
     api.__path__.append(str(Path(__file__).parent / "plugin_mys_schema"))
     models = import_module(prefix + ".models")
@@ -663,14 +778,9 @@ def install_mys(package):
         setattr(api, name, getattr(models, name))
     api.MysApi = MysApi
     api.__all__ = ["models", "request"]
-    endpoints = package(prefix + ".api")
-    endpoints.ApiEndpoint = ApiEndpoint
-    endpoints.BBS_URL = BBS_URL
-    endpoints.RECORD_BASE, endpoints.RECORD_BASE_OS = RECORD_BASE, RECORD_BASE_OS
-    for key, value in ENDPOINTS.items():
-        setattr(endpoints, key, value)
-    for key, value in PUBLIC_ENDPOINT_DECLARATIONS.items():
-        setattr(endpoints, key, value)
+    # Publishing an endpoint describes its URL. Request admission stays in
+    # _send_owner and does not use this public namespace as an allowlist.
+    import_module(prefix + ".api")
     base = package(prefix + ".base_request")
     base.BaseMysApi = BaseMysApi
     base.RECOGNIZE_SERVER = SERVER

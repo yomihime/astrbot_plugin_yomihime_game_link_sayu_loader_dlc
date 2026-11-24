@@ -8,6 +8,19 @@ from contract_inventory import contract_record, symbols
 
 
 class ContractInventoryTests(unittest.TestCase):
+    def test_explicit_private_imports_and_sampled_methods_are_indexed(self):
+        source = """
+from base import _export
+_setting = True
+class _Client:
+    def _request(self): ...
+    def _other(self): ...
+    def read(self): ...
+"""
+        names = {"_export", "_setting", "_Client", "_Client._request"}
+        rows = symbols(ast.parse(source).body, referenced=names)
+        self.assertEqual({name for name, _, _ in rows}, names | {"_Client.read"})
+
     def test_conditional_exports_and_declared_protocols_keep_native_provenance(self):
         source = """
 try:

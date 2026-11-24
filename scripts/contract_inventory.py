@@ -68,35 +68,38 @@ def consumers():
     return result
 
 
-def symbols(body, prefix=""):
+def symbols(body, prefix="", referenced=frozenset()):
+    def exposed(name):
+        return not name.startswith("_") or prefix + name in referenced
+
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not node.name.startswith("_") or (
+            if exposed(node.name) or (
                 prefix and node.name.startswith("__") and node.name.endswith("__")
             ):
                 name = prefix + node.name
                 yield name, node, type(node).__name__
                 if isinstance(node, ast.ClassDef):
-                    yield from symbols(node.body, name + ".")
+                    yield from symbols(node.body, name + ".", referenced)
         elif isinstance(node, (ast.AnnAssign, ast.Assign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
-                if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                if isinstance(target, ast.Name) and exposed(target.id):
                     yield prefix + target.id, node, "attribute"
         elif isinstance(node, (ast.Import, ast.ImportFrom)) and not prefix:
             for item in node.names:
                 name = item.asname or item.name.split(".", 1)[0]
-                if not name.startswith("_"):
+                if exposed(name):
                     yield name, node, "import"
-        elif isinstance(node, ast.TypeAlias) and not node.name.id.startswith("_"):
+        elif isinstance(node, ast.TypeAlias) and exposed(node.name.id):
             yield prefix + node.name.id, node, "type_alias"
         elif isinstance(node, (ast.If, ast.Try, ast.TryStar)):
-            yield from symbols(node.body, prefix)
-            yield from symbols(node.orelse, prefix)
+            yield from symbols(node.body, prefix, referenced)
+            yield from symbols(node.orelse, prefix, referenced)
             if isinstance(node, (ast.Try, ast.TryStar)):
                 for handler in node.handlers:
-                    yield from symbols(handler.body, prefix)
-                yield from symbols(node.finalbody, prefix)
+                    yield from symbols(handler.body, prefix, referenced)
+                yield from symbols(node.finalbody, prefix, referenced)
 
 
 def proof_index():
@@ -164,6 +167,7 @@ def proof_index():
             "utils.api.mys.base_request.BaseMysApi.get_server_id",
             "utils.api.mys.api.ApiEndpoint.get",
         ],
+        "mys_read_error_contract": ["utils.api.mys.base_request.BaseMysApi._mys_request"],
         "account_enumeration_contract": [
             "utils.database.base_models." + name
             for name in (
@@ -180,7 +184,17 @@ def proof_index():
             )
         ],
         "mys_cache_contract": ["utils.cache.gs_cache"],
-        "mys_models_contract": ["utils.api.mys.models"],
+        "mys_models_contract": [
+            "utils.api.mys.models", "utils.api.mys.api",
+            "utils.api.mys.api.ApiEndpoint.__str__", "utils.api.mys.api.ApiEndpoint.has_cn",
+            "utils.api.mys.api.ApiEndpoint.has_os",
+            *(
+                "utils.api.mys.api." + name.id
+                for stmt in parse(ROOT / "worker/plugin_mys_schema/api.py").body
+                if isinstance(stmt, ast.Assign)
+                for name in stmt.targets if isinstance(name, ast.Name) and name.id.isupper()
+            ),
+        ],
         "subscribe_contract": ["subscribe.GsCoreSubscribe"],
         "help_contract": [
             "help.model.PluginHelp",
@@ -216,6 +230,7 @@ def proof_index():
             "handler.decode_inbound_frame",
         ],
         "user_language_contract": [
+            "bot.call_bot",
             "bot.Bot.get_lang",
             "bot.Bot.t",
             "utils.database.models.CoreUser.get_user_lang",
@@ -300,9 +315,10 @@ PROBE_LIMITS = {
     "orm": "Compared private SQLite models and sessions. Owner partitions and the outermost savepoint differ.",
     "image_tools": "Compared fixed drawing inputs, pixels and exceptions. Inputs and rendered surfaces are bounded.",
     "mys_account": "Isolated credentials and controlled HTTP. No production login, signing issuer or service acceptance.",
+    "mys_read_error": "Owner's read-only GET, connection refusal, malformed response, ordered messages, and no-Bot failure. Uncertain requests are not replayed.",
     "account_enumeration": "Compared raw lists with a private administrator grant. Ordinary production chat cannot enumerate.",
     "mys_cache": "Compared cache inputs and response behavior in isolated processes.",
-    "mys_models": "Compared pinned model definitions. Individual game API payload variants need further tests.",
+    "mys_models": "Compared pinned model definitions and public endpoint values and regions. A declaration does not authorize network access.",
     "subscribe": "Compared role-scoped records. End-to-end scheduled external delivery requires a target grant.",
     "help": "Compared help drawing and output bytes. Host projection has separate size and legibility limits.",
     "scheduler": "Compared job registration and management. See scheduler_timing_contract.py for misfires and retirement.",
@@ -364,13 +380,18 @@ def main():
     sources = files(args.reference)
     uses = consumers()
     proofs = proof_index()
+    referenced = set(uses) | set(proofs)
+    # Include the containing class when a probe exercises a nested private method.
+    referenced.update(name.rpartition(".")[0] for name in tuple(referenced))
     if not args.contracts:
         print("symbol\tkind\tsource\tline\texplicit_plugin_imports\tbehavior_probe")
     for path in sources:
         rel = path.relative_to(args.reference)
         module = ".".join(rel.with_suffix("").parts).removesuffix(".__init__")
         tree = parse(path)
-        for name, node, kind in [("", tree, "module"), *symbols(tree.body)]:
+        prefix = module + "."
+        local_names = {name[len(prefix):] for name in referenced if name.startswith(prefix)}
+        for name, node, kind in [("", tree, "module"), *symbols(tree.body, referenced=local_names)]:
             line = getattr(node, "lineno", 1)
             symbol = module + ("." + name if name else "")
             if args.contracts:

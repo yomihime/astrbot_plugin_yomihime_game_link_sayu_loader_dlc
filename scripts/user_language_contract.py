@@ -17,6 +17,73 @@ from build_local import worker_archive  # noqa: E402
 from native_contract import REFERENCE_COMMIT, copy_reference, offline  # noqa: E402
 
 
+async def observe_call_bot(make_bot):
+    from gsuid_core.bot import call_bot
+
+    def missing():
+        try:
+            call_bot()
+        except ValueError as exc:
+            return str(exc)
+        raise AssertionError("unexpected Bot outside the handler stack")
+
+    async def find_after_await():
+        await asyncio.sleep(0)
+        return call_bot()
+
+    async def nearest(first, second):
+        return await find_after_await() is first
+
+    async def by_keyword(*, target):
+        return await find_after_await() is target
+
+    def args_only(*args, **kwargs):
+        return missing()
+
+    async def child_without_bot():
+        return missing()
+
+    async def handler(bot):
+        inner = make_bot("inner")
+        return {
+            "self": await find_after_await() is bot,
+            "nearest": await nearest(inner, bot),
+            "keyword_only": await by_keyword(target=inner),
+            "detached": await asyncio.create_task(child_without_bot()),
+            "thread": await asyncio.to_thread(missing),
+        }
+
+    async def error_translation(bot):
+        return await call_bot().t(
+            "[mys_request] 请求错误, 请联系Bot主人检查控制台! 错误信息: {e}",
+            e="fixture",
+        )
+
+    # Locals and varargs are outside the native lookup contract.
+    local = make_bot()
+    absent = missing()
+    varargs = args_only(local, other=local)
+    left, right = await asyncio.gather(handler(local), handler(make_bot("other")))
+    assert absent and absent == varargs
+    assert (
+        left
+        == right
+        == {
+            "self": True,
+            "nearest": True,
+            "keyword_only": True,
+            "detached": absent,
+            "thread": absent,
+        }
+    )
+    return {
+        "no_bot": absent,
+        "varargs": varargs,
+        "tasks": [left, right],
+        "translation": await error_translation(local),
+    }
+
+
 async def check(mode, phase, worker):
     sys.addaudithook(offline)
     native = mode == "native"
@@ -83,6 +150,7 @@ async def check(mode, phase, worker):
             report["translated"] = await fresh.t(
                 "server.bot_connected", bot_id="sample"
             )
+            report["call_bot"] = await observe_call_bot(make_bot)
             report["stored"] = [
                 r.language
                 for r in await CoreUser.select_rows(user_id="actor", bot_id="astrbot")

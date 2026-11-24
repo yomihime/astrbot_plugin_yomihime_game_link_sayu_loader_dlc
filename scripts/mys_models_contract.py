@@ -1,4 +1,4 @@
-"""Verify the vendored GsCore TypedDict declarations and their worker-archive imports."""
+"""Compare pinned type and endpoint declarations through native and archive imports."""
 
 import argparse
 import ast
@@ -18,6 +18,7 @@ from native_contract import REFERENCE_COMMIT, ROOT
 
 PREFIX = "gsuid_core.utils.api.mys"
 SCHEMA = "c2f982ed824d5b4660743e9963c8683401b23c1bd9ed9b4fce702af414f9d6e7"
+ENDPOINT_SHA256 = "d3c3d0544f18da993eedae0182aea4e9476024d929831558f0f6223cb2cc9887"
 
 
 def schema_files(directory):
@@ -78,6 +79,11 @@ def check(reference):
     product = schema_files(vendored)
     if product != files:
         raise AssertionError("schema sources differ")
+    endpoint_source = (vendored.parent / "api.py").read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(endpoint_source).hexdigest() == ENDPOINT_SHA256
+    assert endpoint_source == (native_dir / "api.py").read_bytes().replace(
+        b"\r\n", b"\n"
+    )
     modules = [Path(name).stem for name in files]
     parent_ast = ast.parse((native_dir / "__init__.py").read_bytes())
     parent_names = [
@@ -89,11 +95,13 @@ def check(reference):
     with tempfile.TemporaryDirectory(prefix="mys-schema-") as tmp:
         archive = Path(tmp) / "worker.pyz"
         with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("plugin_mys_schema/api.py", endpoint_source)
             for name in ("plugin_mys.py", "plugin_bindings.py"):
                 output.write(ROOT / "worker" / name, name)
             for name, raw in product.items():
                 output.writestr("plugin_mys_schema/models/" + name, raw)
         outputs = []
+        endpoints = []
         for run in ("native", "worker"):
             with (
                 patch.dict(sys.modules),
@@ -122,9 +130,36 @@ def check(reference):
                         raise AssertionError("parent package re-exports differ")
                     if str(archive) not in parent.models.__file__:
                         raise AssertionError("schema did not load from worker archive")
+                api = importlib.import_module(PREFIX + ".api")
+                assert parent.api is api and api.ApiEndpoint.__module__ == api.__name__
+                if run == "worker":
+                    assert str(archive) in api.__file__
+                observations = {}
+                for name, value in vars(api).items():
+                    if not name.isupper():
+                        continue
+                    if isinstance(value, str):
+                        observations[name] = value
+                        continue
+                    assert isinstance(value, api.ApiEndpoint)
+                    regions = []
+                    for overseas in (False, True):
+                        try:
+                            regions.append(value.get(overseas))
+                        except ValueError as exc:
+                            regions.append(("ValueError", str(exc)))
+                    observations[name] = (
+                        value.name,
+                        value.has_cn,
+                        value.has_os,
+                        str(value),
+                        regions,
+                    )
+                endpoints.append(observations)
                 outputs.append(inspect_models(modules))
         if outputs[0] != outputs[1]:
             raise AssertionError("TypedDict metadata or package export mismatch")
+        assert endpoints[0] == endpoints[1]
     fields, exports = outputs[0]
     return {
         "reference": REFERENCE_COMMIT,
@@ -133,6 +168,7 @@ def check(reference):
         "type_names": len(fields),
         "annotated_fields": sum(len(row["fields"]) for row in fields.values()),
         "export_count": len(exports),
+        "endpoint_module_constants": len(endpoints[0]),
         "parent_exports": parent_names,
     }
 

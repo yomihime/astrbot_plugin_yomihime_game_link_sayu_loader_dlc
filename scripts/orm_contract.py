@@ -90,6 +90,133 @@ async def presentation(models):
     return values
 
 
+async def account_selection(*, native=False):
+    from gsuid_core.utils.api.mys_api import mys_api
+    from gsuid_core.utils.database.models import GsUID, GsUser
+
+    owner = {"user_id": "actor", "bot_id": "adapter"}
+    primary, spare = "100009001", "100009002"
+    sr_primary, sr_spare = "100009003", "100009004"
+    aliases = [str(100008001 + index) for index in range(4)]
+    for suffix, uid, sr_uid in (
+        ("primary", primary, sr_primary),
+        ("spare", spare, sr_spare),
+    ):
+        await GsUser.full_insert_data(
+            **owner,
+            uid=uid,
+            sr_uid=sr_uid,
+            region="cn_gf01",
+            sr_region="prod_gf_cn",
+            cookie=f"fixture-cookie-{suffix}",
+            stoken=f"fixture-stoken-{suffix}",
+            fp=f"fixture-fp-{suffix}",
+            device_id=f"fixture-device-{suffix}",
+        )
+    await GsUID.full_insert_data(
+        main_uid=primary,
+        game_name="gs",
+        **{f"uid_{n}": alias for n, alias in enumerate(aliases, start=1)},
+    )
+    await GsUID.full_insert_data(main_uid=sr_spare, game_name="sr", uid_1=aliases[0])
+    await GsUID.full_insert_data(main_uid=spare, game_name=None, uid_1=aliases[0])
+
+    async def selected(uid, game, suffix):
+        return {
+            "owner": await mys_api.get_ck(uid, "OWNER", game)
+            == f"fixture-cookie-{suffix}",
+            "random": await mys_api.get_ck(uid, "RANDOM", game)
+            == f"fixture-cookie-{suffix}",
+            "stoken": await mys_api.get_stoken(uid, game) == f"fixture-stoken-{suffix}",
+            "fp": await mys_api.get_user_fp(uid, game) == f"fixture-fp-{suffix}",
+            "device": await mys_api.get_user_device_id(uid, game)
+            == f"fixture-device-{suffix}",
+        }
+
+    checks = {}
+    for index, alias in enumerate(aliases, start=1):
+        assert await mys_api.get_uid(alias, "gs") == primary
+        checks[f"gs_alias_{index}"] = await selected(alias, "gs", "primary")
+    for name, game, canonical in (
+        ("sr_alias", "sr", sr_spare),
+        ("default_alias", None, spare),
+    ):
+        assert await mys_api.get_uid(aliases[0], game) == canonical
+        checks[name] = await selected(aliases[0], game, "spare")
+    checks["integer_uid"] = await selected(int(primary), "gs", "primary")
+    assert all(all(result.values()) for result in checks.values())
+
+    # The default values in GsUID.uid_2 through uid_4 are NULL. Native SQLite
+    # matches those columns if passed Python None despite the API's str annotation.
+    if native:
+        assert await mys_api.get_uid(None, "sr") == sr_spare
+        assert all((await selected(None, "sr", "spare")).values())
+        absent_role = "matched_unset_alias"
+    else:
+        for read, args in (
+            (mys_api.get_uid, (None, "sr")),
+            (mys_api.get_ck, (None, "RANDOM", "sr")),
+            (mys_api.get_ck, ("", "OWNER", "sr")),
+            (mys_api.get_stoken, (None, "sr")),
+            (mys_api.get_user_fp, (None, "sr")),
+            (mys_api.get_user_device_id, (None, "sr")),
+        ):
+            try:
+                await read(*args)
+            except ValueError as exc:
+                assert "role ID" in str(exc)
+            else:
+                raise AssertionError("account data was accessible without a role ID")
+        absent_role = "role_id_required"
+
+    async def cookie(uid, game):
+        value = await mys_api.get_ck(uid, "RANDOM", game)
+        if value is None:
+            return None
+        for name in ("primary", "spare"):
+            if value == f"fixture-cookie-{name}":
+                return name
+        raise AssertionError("unexpected account selection")
+
+    await GsUser.mark_invalid("fixture-cookie-primary", "expired")
+    inactive = {
+        "owner_keeps_own": await mys_api.get_ck(primary, "OWNER", "gs")
+        == "fixture-cookie-primary",
+        "stoken_keeps_own": await mys_api.get_stoken(primary, "gs")
+        == "fixture-stoken-primary",
+        "same_region": await cookie(aliases[1], "gs"),
+        "sr_same_region": await cookie(sr_primary, "sr"),
+        "default_fallback": await cookie(primary, None),
+    }
+    assert inactive == {
+        "owner_keeps_own": True,
+        "stoken_keeps_own": True,
+        "same_region": "spare",
+        "sr_same_region": "spare",
+        "default_fallback": "spare",
+    }
+    # Native's global fallback also works for an unknown role. The Loader only
+    # permits fallback when the caller has a row for that role in this private file.
+    unknown = await cookie("100009999", "gs")
+    assert unknown == ("spare" if native else None)
+    await GsUser.update_data_by_uid_without_bot_id(
+        spare, "gs", region="os_usa", status=""
+    )
+    inactive["wrong_region"] = await cookie(primary, "gs")
+    inactive["sr_empty_status_same_region"] = await cookie(sr_primary, "sr")
+    inactive["empty_status_without_region"] = await cookie(primary, None)
+    assert inactive["wrong_region"] is inactive["empty_status_without_region"] is None
+    assert inactive["sr_empty_status_same_region"] == "spare"
+    await GsUser.update_data_by_uid_without_bot_id(primary, "gs", status=None)
+    inactive["restored"] = await cookie(aliases[-1], "gs")
+    assert inactive["restored"] == "primary"
+    return {
+        "same": {"aliases_and_fields": checks, "status": inactive},
+        "unknown_role": unknown,
+        "absent_role": absent_role,
+    }
+
+
 async def account_rows(*, native=False):
     from contextlib import ExitStack
     from unittest.mock import patch
@@ -334,6 +461,7 @@ async def child(kind, source, worker):
             "preferences": await presentation(models),
             "numeric_uids": await bind_lifecycle(models.WavesBind),
             "account_rows": await account_rows(native=True),
+            "account_selection": await account_selection(native=True),
         }
     sys.path.insert(0, str(worker))
     import plugin_bindings
@@ -389,6 +517,8 @@ async def child(kind, source, worker):
         )
 
     if kind == "reload":
+        from gsuid_core.utils.api.mys_api import mys_api
+
         with actor():
             uid = await models.WavesBind.get_uid_by_game("actor", "adapter")
             assert await models.WavesLangSettings.get_lang("actor") == "kr"
@@ -403,9 +533,23 @@ async def child(kind, source, worker):
                 await models.WavesBind.get_uid_by_game("uid-owner", "uid-adapter")
                 == "000000284"
             )
+        with actor(account_records=True):
+            assert (
+                await mys_api.get_ck("100008001", "OWNER", "gs")
+                == "fixture-cookie-primary"
+            )
+        for name, adapter in (("other", "adapter"), ("actor", "other")):
+            with actor(name, adapter=adapter, account_records=True):
+                assert await mys_api.get_uid("100008001", "gs") == "100008001"
+                assert await mys_api.get_ck("100009001", "RANDOM", "gs") is None
+                assert await mys_api.get_stoken("100009001", "gs") is None
+                assert await mys_api.get_user_fp("100009001", "gs") is None
+                assert await mys_api.get_user_device_id("100009001", "gs") is None
         return {
             "persistent_uid": uid,
             "persistent_numeric_uid": "000000284",
+            "persisted_account_and_alias": True,
+            "foreign_actor_and_adapter_isolated": True,
             "migration": first,
         }
     with actor(writable=True):
@@ -512,6 +656,7 @@ async def child(kind, source, worker):
         await must_deny(models.WavesUser.get_user_cookie_by_uid("11"))
     with actor(account_records=True):
         records = await account_rows()
+        selection = await account_selection()
         assert await models.WavesUser.get_user_cookie_by_uid("1102") == "fixture"
         await must_deny(models.WavesUser.base_select_data(user_id="other"))
         await must_deny(
@@ -592,6 +737,7 @@ async def child(kind, source, worker):
         "preferences": preferences,
         "numeric_uids": numeric_uids,
         "account_rows": records,
+        "account_selection": selection,
         "owner_checks": len(limits),
         "concurrent_increments": 2,
         "migrations": [first, repeated, failed, recovered],
@@ -670,11 +816,17 @@ def main():
     args.output.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    if not args.child and any(
-        report["native"][k] != report["loader"][k]
-        for k in ("observations", "preferences", "numeric_uids", "account_rows")
-    ):
-        raise SystemExit("native/loader model results differ")
+    if not args.child:
+        if any(
+            report["native"][k] != report["loader"][k]
+            for k in ("observations", "preferences", "numeric_uids", "account_rows")
+        ):
+            raise SystemExit("native/loader model results differ")
+        if (
+            report["native"]["account_selection"]["same"]
+            != report["loader"]["account_selection"]["same"]
+        ):
+            raise SystemExit("native/loader owner account selection differs")
 
 
 if __name__ == "__main__":

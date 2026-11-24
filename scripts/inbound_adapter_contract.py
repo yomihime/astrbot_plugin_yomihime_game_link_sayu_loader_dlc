@@ -150,6 +150,48 @@ def snapshot(event, lookup):
     return {"event": value, "resources": resources}
 
 
+async def compare_sdk_text(handler):
+    import sayu_compat
+    from gsuid_core.models import Message, MessageReceive
+    from msgspec import to_builtins
+
+    async def capture(event, *, mapped):
+        assert not mapped
+        return event
+
+    results = []
+    for kind, room, text in (
+        ("direct", "", "  bind @actor [图片]  "),
+        ("group", "room", "  bind @actor [图片]  "),
+        ("direct", "", ""),
+        ("group", "room", " \t "),
+    ):
+        message = MessageReceive(
+            bot_id="adapter",
+            msg_id="invocation",
+            user_id="actor",
+            user_type=kind,
+            group_id=room,
+            content=[Message("text", text)],
+        )
+        native = await handler.msg_process(message)
+        with patch.object(sayu_compat, "dispatch_event", capture):
+            actual = await sayu_compat.dispatch(
+                text,
+                actor_id="actor",
+                adapter_id="adapter",
+                message_id="invocation",
+                conversation_kind=kind,
+                group_id=room,
+            )
+        left, right = to_builtins(native), to_builtins(actual)
+        # The SDK carries no native websocket connection.
+        assert left.pop("WS_BOT_ID") is None and right.pop("WS_BOT_ID") == ""
+        assert left == right and native.session_id == actual.session_id
+        results.append({"kind": kind, "text": text, "event": right})
+    return results
+
+
 async def compare():
     sys.addaudithook(offline)
     from gsuid_core.utils.database import base_models as db
@@ -219,9 +261,14 @@ async def compare():
         )
         assert event.user_pm == 6
         ordinary[name] = event.user_pm
+    sdk_text = await compare_sdk_text(handler)
     await core_shutdown_execute()
     await db.engine.dispose()
-    return {"cases": observations, "without_role_authority": ordinary}
+    return {
+        "cases": observations,
+        "without_role_authority": ordinary,
+        "sdk_text": sdk_text,
+    }
 
 
 if __name__ == "__main__":

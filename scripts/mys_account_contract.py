@@ -112,7 +112,11 @@ class Capture:
         self.record(
             req.method, req.url.copy_with(query=None), req.headers, req.url.params
         )
-        return Response(200, json=self.payload)
+        return Response(
+            200,
+            content=json.dumps(self.payload),
+            headers={"Content-Type": "application/json"},
+        )
 
 
 async def exercise(api, endpoint, capture):
@@ -175,6 +179,29 @@ async def overseas_record(api, endpoint_cls, capture):
     return {"case": "starrail_os", "value": value, "requests": capture.calls[start:]}
 
 
+async def response_shapes(api, endpoint, capture):
+    observations = []
+    for payload in (
+        ["notice"],
+        "unavailable",
+        None,
+        {"retcode": None, "code": -42},
+        {"code": ""},
+        {"retcode": 0, "code": -42},
+    ):
+        capture.payload = payload
+        before = len(capture.calls)
+        try:
+            value = await api.endpoint_request(
+                endpoint, UID, params={"role_id": UID}, ds_mode="none"
+            )
+            outcome = {"value": value}
+        except (TypeError, KeyError) as exc:
+            outcome = {"error": type(exc).__name__, "message": str(exc)}
+        observations.append({**outcome, "requests": len(capture.calls) - before})
+    return observations
+
+
 async def main_async(work, worker):
     sys.addaudithook(offline)
     from gsuid_core.utils.database import base_models as db
@@ -208,6 +235,7 @@ async def main_async(work, worker):
         native_api = _MysApi()
         native = await exercise(native_api, DAILY_NOTE, native_capture)
         native.append(await overseas_record(native_api, ApiEndpoint, native_capture))
+        native_shapes = await response_shapes(native_api, DAILY_NOTE, native_capture)
     await db.engine.dispose()
 
     sys.path.insert(0, str(worker))
@@ -215,14 +243,8 @@ async def main_async(work, worker):
     import httpx2
     from plugin_bindings import binding_scope
 
-    for name, product in mys.PUBLIC_ENDPOINT_DECLARATIONS.items():
-        reference = getattr(native_endpoints, name)
-        if (reference.cn, reference.os, reference.name) != (
-            product.cn,
-            product.os,
-            product.name,
-        ):
-            raise ValueError(f"endpoint mismatch for {name}")
+    for name, url in mys.PUBLIC_BBS_READ_ROUTES.items():
+        assert url == getattr(native_endpoints, name).get().partition("?")[0]
 
     session = mys.Account(
         UID,
@@ -305,7 +327,25 @@ async def main_async(work, worker):
             raise AssertionError(
                 "an account challenge must terminate after the first HTTP reply"
             )
-    return result, headers
+        shapes = await response_shapes(api, mys.ENDPOINTS["DAILY_NOTE"], loader_capture)
+        # With the reference's default logging configuration, logging a JSON
+        # null fails before the membership test. Preserve both exceptions.
+        assert native_shapes[2] == {
+            "error": "KeyError",
+            "message": "'event'",
+            "requests": 1,
+        }
+        assert shapes[:2] + shapes[3:] == native_shapes[:2] + native_shapes[3:]
+        assert [r.get("value", r.get("error")) for r in shapes] == [
+            ["notice"],
+            "unavailable",
+            "TypeError",
+            None,
+            "",
+            {"retcode": 0, "code": -42},
+        ]
+        assert all(r["requests"] == 1 for r in shapes)
+    return result, headers, {"native": native_shapes, "loader": shapes}
 
 
 def main():
@@ -323,7 +363,9 @@ def main():
         copy_reference(args.reference, work)
         sys.path.insert(0, str(work))
         try:
-            result, headers = asyncio.run(main_async(work, args.worker.resolve()))
+            result, headers, shapes = asyncio.run(
+                main_async(work, args.worker.resolve())
+            )
         finally:
             # The native core installs a Windows file logger in the temporary tree.
             logging.shutdown()
@@ -337,6 +379,7 @@ def main():
                         (args.worker / "plugin_mys.py").read_bytes()
                     ).hexdigest(),
                     "cases": result,
+                    "response_shapes": shapes,
                     "headers": headers,
                     "scope": {
                         "native_boundary": "aiohttp built and serialized the request. An in-memory asyncio.Transport recorded its actual wire request line and headers and supplied an HTTP/1.1 JSON reply to the original aiohttp response parser.",
@@ -345,7 +388,7 @@ def main():
                         "signature": "native generated its digest from the fixture; the signed loader cases used an explicitly synthetic issuer. No digest equality or online authorization was tested",
                         "unsigned": "ds_mode=none and _mys_req_get use the normal loader path without an issuer. Standard transport and upstream app headers may differ (listed per request)",
                         "returns": "matched the reported responses, missing-data exception, ordinary numeric errors and number of requests for the simulated inputs",
-                        "differences": "cross-owner credential fallback is denied, a challenge stops on its first reply; native retries some transport errors and may send a bot message, whereas the loader propagates transport/decoding exceptions",
+                        "differences": "cross-owner credential fallback is denied and a challenge stops on its first reply. See mys_read_error_contract.py for confirmed connection and response failures. A JSON null triggers different exception types under native default logging.",
                     },
                     "loader_only": {
                         "second_actor": {"value": -51, "http_calls": 0},
