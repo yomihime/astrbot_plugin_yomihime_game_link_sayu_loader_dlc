@@ -13,8 +13,9 @@ against the same native result and asserts the exact request-field differences.
 import argparse
 import asyncio
 import base64
-from contextlib import asynccontextmanager, closing, ExitStack
+from contextlib import asynccontextmanager, closing, ExitStack, nullcontext
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_local import ROOT, LOCAL, worker_archive
 from environments import selected
 from native_contract import REFERENCE_COMMIT, copy_reference, offline
+import mys_package_session_fixture as mys_session
 
 LOCK = json.loads((ROOT / "profiles/lock.json").read_bytes())
 UID_A, UID_B = "100000071", "100000082"
@@ -108,6 +110,13 @@ def snapshot(databases, key):
                     "SELECT user_id,uid,cookie,did FROM wavesuser WHERE bot_id='onebot' AND user_id IN ('A','B')"
                 ):
                     credentials.append([actor, uid, cookie == SYNTHETIC, did == DEVICE])
+            if key != "waves" and "gsuser" in tables:
+                for actor, uid, cookie in db.execute(
+                    f"SELECT user_id,{column},cookie FROM gsuser WHERE bot_id='onebot' AND user_id IN ('A','B')"
+                ):
+                    credentials.append(
+                        [actor, uid, bool(cookie and SYNTHETIC in cookie)]
+                    )
     return {"bindings": bindings, "credential_rows": sorted(credentials)}
 
 
@@ -127,7 +136,7 @@ def compact(kind, data):
 
 
 @asynccontextmanager
-async def native(work, package, libraries, lifecycle):
+async def native(work, package, libraries, lifecycle, include_core_login=False):
     sys.path[:0] = [str(work), str(work / "gsuid_core")]
     sys.path.append(str(libraries))
     from gsuid_core.utils.database import base_models as db
@@ -144,6 +153,8 @@ async def native(work, package, libraries, lifecycle):
 
     server.refresh_installed_dependencies()
     gss.is_load = True
+    if include_core_login:
+        importlib.import_module("gsuid_core.buildin_plugins.core_command.user_login")
     gss._import_module_list(gss.load_plugin(work / "gsuid_core/plugins" / package))
     lifecycle["hooks"] = {
         name: sorted(h.func.__module__ + "." + h.func.__name__ for h in hooks)
@@ -340,7 +351,9 @@ def install_loader_io(stack, work):
     return bool(resource_broker.CLIENT)
 
 
-async def child(key, mode, work, libraries, stack, lifecycle):
+async def child(
+    key, mode, work, libraries, stack, lifecycle, include_core_login=False, stored=False
+):
     if mode == "loader":
         lifecycle["resource_broker"] = install_loader_io(stack, work)
     else:
@@ -427,6 +440,12 @@ async def child(key, mode, work, libraries, stack, lifecycle):
         return answer
 
     def offline_httpx2(request):
+        if include_core_login:
+            payload = mys_session.reply(
+                request.method, request.url, request.headers, key, http_details
+            )
+            if payload is not None:
+                return httpx2.Response(200, json=payload, request=request)
         target = [request.method, request.url.host, request.url.path]
         if lifecycle["phase"] == "dispatch":
             hits.append(target)
@@ -443,6 +462,12 @@ async def child(key, mode, work, libraries, stack, lifecycle):
         return offline_httpx2(request)
 
     async def external(self, request):
+        if include_core_login:
+            payload = mys_session.reply(
+                request.method, request.url, request.headers, key, http_details
+            )
+            if payload is not None:
+                return httpx.Response(200, json=payload, request=request)
         hits.append([request.method, request.url.host, request.url.path])
         if str(request.url) == "https://event.kurobbs.com/event/ip":
             return httpx.Response(200, text="192.0.2.1", request=request)
@@ -467,6 +492,13 @@ async def child(key, mode, work, libraries, stack, lifecycle):
         target = urlsplit(str(url))
         data = kwargs.get("data") or {}
         headers = kwargs.get("headers", {})
+        if include_core_login:
+            payload = mys_session.reply(method, url, headers, key, http_details)
+            return Response(
+                payload
+                if payload is not None
+                else {"retcode": -1, "message": "offline origin"}
+            )
         token = headers.get("token")
         secondary = headers.get("b-at") == "fixture-secondary"
         if target.hostname == "api.kurobbs.com":
@@ -518,7 +550,9 @@ async def child(key, mode, work, libraries, stack, lifecycle):
     backend = (
         loader(work, key, lifecycle)
         if mode == "loader"
-        else native(work, LOCK[key]["package"], libraries, lifecycle)
+        else native(
+            work, LOCK[key]["package"], libraries, lifecycle, include_core_login
+        )
     )
     with ExitStack() as stack:
         stack.enter_context(patch.object(httpx.AsyncClient, "send", observe_send))
@@ -533,7 +567,7 @@ async def child(key, mode, work, libraries, stack, lifecycle):
         stack.enter_context(
             patch.object(httpx.AsyncHTTPTransport, "handle_async_request", external)
         )
-        if key == "waves":
+        if key == "waves" or include_core_login:
             import aiohttp
 
             stack.enter_context(
@@ -542,16 +576,27 @@ async def child(key, mode, work, libraries, stack, lifecycle):
         async with backend as (send, handlers):
             rows = []
             denied = {}
-            for i, (label, actor, text) in enumerate(scenarios(key)):
+            inputs = (
+                mys_session.scenarios(key, stored=stored)
+                if include_core_login
+                else scenarios(key)
+            )
+            for i, (label, actor, text) in enumerate(inputs):
                 hits.clear()
                 http_details.clear()
+                calls = []
                 adapter = "alt" if label == "credential_other_adapter" else "onebot"
                 try:
-                    value = {
-                        "parts": await asyncio.wait_for(
-                            send(actor, text, i, adapter), 25
-                        )
-                    }
+                    with (
+                        mys_session.handler_trace(calls)
+                        if include_core_login
+                        else nullcontext()
+                    ):
+                        value = {
+                            "parts": await asyncio.wait_for(
+                                send(actor, text, i, adapter), 25
+                            )
+                        }
                 except Exception as e:
                     value = {
                         "error": type(e).__name__,
@@ -566,10 +611,13 @@ async def child(key, mode, work, libraries, stack, lifecycle):
                         "case": label,
                         "actor": actor,
                         "adapter": adapter,
-                        "input": text.replace(SYNTHETIC, "<fixture-token>").replace(
+                        "input": "core添加 <synthetic credential>"
+                        if include_core_login and label == "cookie"
+                        else text.replace(SYNTHETIC, "<fixture-token>").replace(
                             DEVICE, "<fixture-device>"
                         ),
                         **value,
+                        **({"executed_handlers": calls} if include_core_login else {}),
                         "external_http": hits.copy(),
                         "http_details": http_details.copy(),
                         "state": snapshot(
@@ -829,6 +877,16 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--child", action="store_true")
+    parser.add_argument(
+        "--mys-session",
+        action="store_true",
+        help="exercise the native built-in Cookie issuer and ordinary game session query",
+    )
+    parser.add_argument(
+        "--mys-stored",
+        action="store_true",
+        help="seed the owner's synthetic GsUser row through the public model in a normal account request",
+    )
     parser.add_argument("--libraries", type=Path)
     parser.add_argument("--native-result", type=Path)
     parser.add_argument("--loader-result", type=Path)
@@ -838,6 +896,12 @@ def main():
     )
     parser.add_argument("--worker-sha256", help="expected hex digest of --worker")
     args = parser.parse_args()
+    if args.mys_stored:
+        args.mys_session = True
+    if args.mys_session and (args.profile == "waves" or args.mode == "policy"):
+        parser.error(
+            "--mys-session applies to genshin/starrail native, loader or compare runs"
+        )
     exit_code = 0
     if bool(args.worker) != bool(args.worker_sha256) or (
         args.worker and args.mode != "loader"
@@ -855,6 +919,15 @@ def main():
                 json.loads(p.read_bytes())
                 for p in (args.native_result, args.loader_result, args.offline_result)
             )
+        )
+    elif args.mode == "compare" and args.mys_session:
+        result = mys_session.verify(
+            args.profile,
+            json.loads(args.native_result.read_bytes()),
+            json.loads(args.loader_result.read_bytes()),
+            args.mys_stored,
+            LOCK[args.profile],
+            REFERENCE_COMMIT,
         )
     elif args.mode == "compare":
         result = compare(
@@ -875,6 +948,8 @@ def main():
                         args.libraries,
                         outer,
                         lifecycle,
+                        args.mys_session,
+                        args.mys_stored,
                     )
                 )
             except Exception as exc:
@@ -957,6 +1032,8 @@ def main():
                 "utf8",
                 str(Path(__file__).resolve()),
                 "--child",
+                *(["--mys-session"] if args.mys_session else []),
+                *(["--mys-stored"] if args.mys_stored else []),
                 "--profile",
                 args.profile,
                 "--mode",
@@ -967,8 +1044,10 @@ def main():
                 str(out),
             ]
             try:
+                # Original upstream debug messages may contain request credentials.
+                quiet = subprocess.DEVNULL if args.mys_session else None
                 exit_code = subprocess.run(
-                    command, cwd=work, env=env, timeout=240
+                    command, cwd=work, env=env, timeout=240, stdout=quiet, stderr=quiet
                 ).returncode
             except subprocess.TimeoutExpired:
                 exit_code = 124
