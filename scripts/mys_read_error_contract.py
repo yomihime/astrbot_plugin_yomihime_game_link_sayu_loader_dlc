@@ -20,6 +20,17 @@ from native_contract import ROOT, REFERENCE_COMMIT, copy_reference, offline  # n
 
 BAD = b"private-upstream-body-not-for-chat"
 OK = b'{"retcode":0,"data":{"ok":true}}'
+ACCOUNT_REPLIES = {
+    "invalid": BAD,
+    "blank": b" \t ",
+    "ok": OK,
+    "expired": b'{"retcode":-100,"message":"fixture session expired"}',
+    "code_only": b'{"code":10102,"data":null}',
+    "retcode_first": b'{"retcode":-100,"code":0}',
+    "zero_first": b'{"retcode":0,"code":-100,"data":{"uid":"fixture"}}',
+    "bare_data": b'{"data":{"uid":"fixture"}}',
+    "string_code": b'{"code":"-100"}',
+}
 CONNECT = "[mys_request] 请求连接错误..."
 INVALID = "[mys_request] 请求错误, 请联系Bot主人检查控制台! 错误信息: Expecting value: line 1 column 1 (char 0)"
 
@@ -42,7 +53,7 @@ class Exchange:
             assert req.method == "GET" and req.headers["Cookie"] == COOKIE
             if action == "refused":
                 raise ClientConnectorError(req.connection_key, ConnectionRefusedError())
-            payload = {"invalid": BAD, "blank": b" \t "}.get(action, OK)
+            payload = ACCOUNT_REPLIES[action]
             reply = (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                 + str(len(payload)).encode()
@@ -112,7 +123,7 @@ class Exchange:
                 )
             return httpx2.Response(
                 200,
-                content={"invalid": BAD, "blank": b" \t "}.get(action, OK),
+                content=ACCOUNT_REPLIES[action],
                 headers=headers,
             )
 
@@ -213,6 +224,17 @@ async def run(mode, worker):
             ),
             ("exhaust", ["refused", "invalid"], -999, ["GET", CONNECT, "GET", INVALID]),
             ("next_invocation", ["ok"], {"retcode": 0, "data": {"ok": True}}, ["GET"]),
+            ("expired", ["expired"], -100, ["GET"]),
+            ("code_only", ["code_only"], 10102, ["GET"]),
+            ("retcode_first", ["retcode_first"], -100, ["GET"]),
+            (
+                "zero_first",
+                ["zero_first"],
+                {"retcode": 0, "code": -100, "data": {"uid": "fixture"}},
+                ["GET"],
+            ),
+            ("bare_data", ["bare_data"], {"data": {"uid": "fixture"}}, ["GET"]),
+            ("string_code", ["string_code"], "-100", ["GET"]),
         ):
             exchange.reset(faults)
             value = await plugin_callback(target, event)
@@ -222,6 +244,12 @@ async def run(mode, worker):
                 exchange.order,
             )
             shared[name] = {"result": value, "order": exchange.order}
+        row = await GsUser.select_data_by_uid(UID, "gs")
+        assert row is not None and row.cookie == COOKIE and row.status is None
+        shared["account_after_service_errors"] = {
+            "cookie_preserved": True,
+            "status": None,
+        }
         for fault in ("refused", "invalid"):
             exchange.reset([fault])
             try:
@@ -296,7 +324,9 @@ def main():
             if args.worker is None:
                 worker.write_bytes(
                     worker_archive(
-                        json.loads((ROOT / "profiles/lock.json").read_bytes())["genshin"]
+                        json.loads((ROOT / "profiles/lock.json").read_bytes())[
+                            "genshin"
+                        ]
                     )
                 )
             report = {
