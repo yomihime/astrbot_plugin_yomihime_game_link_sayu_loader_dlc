@@ -57,7 +57,9 @@ async def probe(mode, phase):
                 ACTOR, BOT, "000000004"
             )
             result["rotate"] = await GsBind.switch_uid_by_game(ACTOR, BOT)
-            result["set_group"] = await GsBind.update_data(ACTOR, BOT, group_id="room2")
+            result["set_group"] = await GsBind.update_data(
+                ACTOR, BOT, group_id="room2_room3"
+            )
         else:
             result["delete_missing"] = await GsBind.delete_uid(ACTOR, BOT, "000000004")
             result["delete"] = await GsBind.delete_uid(ACTOR, BOT, "000000001")
@@ -65,6 +67,10 @@ async def probe(mode, phase):
         result["list"] = await GsBind.get_uid_list_by_game(ACTOR, BOT)
         result["sr_value"] = await GsBind.get_uid_by_game(ACTOR, BOT, "sr")
         result["group"] = (await GsBind.select_data(ACTOR, BOT)).group_id
+        result["implicit_adapter"] = (await GsBind.select_data(ACTOR)).group_id
+        result["exists"] = await GsBind.bind_exists(ACTOR, BOT)
+        result["first_group"] = await GsBind.get_bind_group(ACTOR, BOT)
+        result["groups"] = await GsBind.get_bind_group_list(ACTOR, BOT)
         event = SimpleNamespace(text="", user_id=ACTOR, at=None, bot_id=BOT)
         result["stored"] = await get_uid(None, event, GsBind, None, True)
         event.text = "input 000000007"

@@ -106,11 +106,11 @@ class PluginRuntime:
 
         plugin_bindings.install(package, self.data)
         install_mys(package)
-        self.enumeration = install_enumeration(sys.modules["gsuid_core.utils.database.models"])
         install_sign(package)
         install_cache(package)
         install_backup(package, self.data, plugin)
         self.orm = install_orm(package, self.data, plugin)
+        self.enumeration = install_enumeration(sys.modules["gsuid_core.utils.database.models"])
         install_subscribe(package, self.orm)
         install_admin(package, source, plugin)
         self.plugin = plugin

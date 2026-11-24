@@ -41,7 +41,7 @@ def preference_columns(model, table, base_id):
     return fields
 
 
-async def guard_physical_table(driver, table, columns):
+async def guard_physical_table(driver, table, columns, *, column_types=None):
     # Check the physical database as well as the imported model. Older profiles
     # may carry extra columns or triggers that the current class never declared.
     async with driver.execute(f'PRAGMA main.table_xinfo("{table}")') as cursor:
@@ -51,7 +51,11 @@ async def guard_physical_table(driver, table, columns):
         or any(row[6] for row in rows)
         or [(r[1], r[2].upper()) for r in rows if r[5]] != [("id", "INTEGER")]
         or any(
-            not re.fullmatch(r"(?:TEXT|VARCHAR(?:\(\d+\))?)", r[2].upper())
+            (
+                r[2].upper() != column_types[r[1]]
+                if column_types is not None
+                else not re.fullmatch(r"(?:TEXT|VARCHAR(?:\(\d+\))?)", r[2].upper())
+            )
             for r in rows
             if r[1] != "id"
         )

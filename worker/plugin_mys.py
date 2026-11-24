@@ -142,6 +142,7 @@ class Account:
     stoken: str | None = None
     device_id: str | None = None
     fp: str | None = None
+    device_info: str | None = None
 
 
 _current_account = ContextVar("mys_account", default=None)
@@ -164,11 +165,7 @@ def _owns_task(owner):
 
 
 @contextmanager
-def account_scope(game, account):
-    """Supply a trusted session for this one private owner invocation."""
-    owner = plugin_bindings._current.get()
-    if not owner or not owner.active or not owner.writable or not _owns_task(owner):
-        raise PermissionError("a writable owner scope is required to supply an account")
+def _lease(owner, game, account):
     value = _Grant(owner, game, account)
     token = _current_account.set(value)
     try:
@@ -179,6 +176,16 @@ def account_scope(game, account):
         _current_account.reset(token)
 
 
+@contextmanager
+def account_scope(game, account):
+    """Supply a trusted session for this one private owner invocation."""
+    owner = plugin_bindings._current.get()
+    if not owner or not owner.active or not owner.writable or not _owns_task(owner):
+        raise PermissionError("a writable owner scope is required to supply an account")
+    with _lease(owner, game, account):
+        yield
+
+
 def _account(uid, game):
     current = _current_account.get()
     owner = plugin_bindings._current.get()
@@ -186,7 +193,7 @@ def _account(uid, game):
         not current
         or not owner
         or not owner.active
-        or not owner.writable
+        or not (owner.writable or owner.account_records)
         or not _owns_task(owner)
         or not current.active
         or current.owner is not owner
@@ -195,6 +202,13 @@ def _account(uid, game):
     ):
         return None
     return current.account
+
+
+def _owner_models():
+    owner = plugin_bindings._current.get()
+    if owner and owner.active and owner.account_records and _owns_task(owner):
+        return sys.modules["gsuid_core.utils.database.models"]
+    return None
 
 
 class GsUser:
@@ -228,8 +242,20 @@ class GsUser:
 class BaseMysApi:
     mysVersion = "2.102.1"
     RECOGNIZE_SERVER = SERVER
-    _HEADER = {}
-    _HEADER_OS = {"x-rpc-language": "zh-cn"}
+    _HEADER = {
+        "x-rpc-app_version": mysVersion,
+        "X-Requested-With": "com.mihoyo.hyperion",
+        "User-Agent": f"Mozilla/5.0 (Linux; Android 13; PHK110 Build/SKQ1.221119.001; wv)AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.133 Mobile Safari/537.36 miHoYoBBS/{mysVersion}",
+        "x-rpc-client_type": "5",
+        "Referer": "https://webstatic.mihoyo.com/",
+        "Origin": "https://webstatic.mihoyo.com/",
+    }
+    _HEADER_OS = {
+        "x-rpc-app_version": "1.5.0",
+        "x-rpc-client_type": "5",
+        "x-rpc-language": "zh-cn",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.5563.116 Safari/537.36",
+    }
 
     def check_os(self, uid, game_name="gs"):
         if game_name in ("gs", "sr"):
@@ -246,20 +272,47 @@ class BaseMysApi:
         return "prod_gf_cn"
 
     async def get_uid(self, uid, game_name=None):
+        models = _owner_models()
+        if models is not None:
+            return await models.GsUID.get_main_uid(uid, game_name)
         return uid
 
     async def get_ck(self, uid, mode="RANDOM", game_name=None):
         if mode not in ("RANDOM", "OWNER"):
             return None
+        models = _owner_models()
+        if models is not None:
+            uid = await self.get_uid(uid, game_name)
+            # A random credential from another account is outside this invocation.
+            if mode == "RANDOM" and not await models.GsUser.cookie_validate(
+                uid, game_name
+            ):
+                return None
+            return await models.GsUser.get_user_cookie_by_uid(uid, game_name)
         return await GsUser.get_user_cookie_by_uid(uid, game_name)
 
     async def get_stoken(self, uid, game_name=None):
+        models = _owner_models()
+        if models is not None:
+            return await models.GsUser.get_user_stoken_by_uid(
+                await self.get_uid(uid, game_name), game_name
+            )
         return await GsUser.get_user_stoken_by_uid(uid, game_name)
 
     async def get_user_fp(self, uid, game_name=None):
+        models = _owner_models()
+        if models is not None:
+            return await models.GsUser.get_user_attr_by_uid(
+                await self.get_uid(uid, game_name), "fp", game_name
+            )
         return await GsUser.get_user_attr_by_uid(uid, "fp", game_name)
 
     async def get_user_device_id(self, uid, game_name=None):
+        models = _owner_models()
+        if models is not None:
+            return await models.GsUser.get_user_attr_by_uid(
+                await self.get_uid(uid, game_name), "device_id", game_name
+            )
         return await GsUser.get_user_attr_by_uid(uid, "device_id", game_name)
 
     async def simple_mys_req(
@@ -299,29 +352,52 @@ class BaseMysApi:
         game = game_name or "gs"
         account = _account(uid, game)
         if (
-            not account
-            or cookie_type not in ("cookie", "stoken")
+            cookie_type not in ("cookie", "stoken")
             or cookie_mode not in ("RANDOM", "OWNER")
             or ds_mode not in ("none", "web", "auto")
         ):
             return -51
+        if account is None:
+            models = _owner_models()
+            if models is None:
+                return -51
+            canonical = await self.get_uid(uid, game)
+            row = await models.GsUser.select_data_by_uid(canonical, game)
+            if row is None or (cookie_mode == "RANDOM" and row.status):
+                return -51
+            if canonical != uid:
+                # Looking up an alias can return the owner's credential, but
+                # sending it for a different role requires a verified target.
+                raise NotImplementedError(
+                    "external record target needs its own authorization"
+                )
+            account = Account(
+                uid,
+                row.cookie,
+                stoken=row.stoken,
+                device_id=row.device_id,
+                fp=row.fp,
+                device_info=row.device_info,
+            )
         credential = account.stoken if cookie_type == "stoken" else account.cookie
         if not credential or (cookie is not None and cookie != credential):
             return -51
         url = endpoint.get(self.check_os(uid, game))
-        return await self._send_owner(
-            account,
-            game,
-            method,
-            url,
-            header,
-            params,
-            data,
-            credential,
-            ds_mode,
-            ds_q,
-            ds_body,
-        )
+        owner = plugin_bindings._current.get()
+        with _lease(owner, game, account):
+            return await self._send_owner(
+                account,
+                game,
+                method,
+                url,
+                header,
+                params,
+                data,
+                credential,
+                ds_mode,
+                ds_q,
+                ds_body,
+            )
 
     async def simple_mys_req_by_region(
         self, endpoint, is_os, params=None, header=None, cookie=None, game_name=None
@@ -426,11 +502,20 @@ class BaseMysApi:
             account.uid, game
         ):
             return -51
-        headers = {}
+        headers = dict(
+            self._HEADER_OS if self.check_os(account.uid, game) else self._HEADER
+        )
         if account.device_id:
             headers["x-rpc-device_id"] = account.device_id
         if account.fp:
             headers["x-rpc-device_fp"] = account.fp
+        if account.device_info is not None:
+            device = account.device_info.split("/")
+            headers["User-Agent"] = (
+                f"Mozilla/5.0 (Linux; Android 13; {device[1]} {device[3]} "
+                "; wv)AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Version/4.0 Chrome/104.0.5112.97Mobile Safari/537.36 miHoYoBBS/2{self.mysVersion}"
+            )
         if ds_mode != "none" or (header and any(key.lower() == "ds" for key in header)):
             if not account.authorize:
                 raise NotImplementedError("account request authorization unavailable")
@@ -518,6 +603,8 @@ class MysApi(BaseMysApi):
 
     async def _cached_record(self, name, uid, ck, params=None):
         account = _account(uid, "gs")
+        if account is None and _owner_models() is not None:
+            return await self._record(name, uid, ck, params)
         if not account or (ck is not None and ck != account.cookie):
             return -51
         cache = _current_account.get().cache

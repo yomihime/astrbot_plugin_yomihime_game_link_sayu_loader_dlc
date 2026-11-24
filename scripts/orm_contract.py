@@ -90,6 +90,101 @@ async def presentation(models):
     return values
 
 
+async def account_rows(*, native=False):
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    from gsuid_core.utils.api.mys.api import DAILY_NOTE
+    from gsuid_core.utils.api.mys_api import mys_api
+    from gsuid_core.utils.database.models import GsUID, GsUser
+    from mys_account_contract import Capture, COOKIE, DEVICE, FP
+
+    uid, alias = "100000917", "100000918"
+    owner = dict(user_id="actor", bot_id="adapter")
+    session = COOKIE
+    assert await GsUser.base_select_data(**owner) is None
+    await GsUser.full_insert_data(
+        **owner,
+        uid=uid,
+        cookie=session,
+        device_id=DEVICE,
+        fp=FP,
+        device_info="fixture/model",
+    )
+    await GsUID.full_insert_data(main_uid=uid, uid_1=alias, game_name="gs")
+    row = await GsUser.base_select_data(**owner)
+    capture = Capture()
+    capture.payload = {"retcode": 0, "data": {"current_resin": 129}}
+    with ExitStack() as stack:
+        if native:
+            stack.enter_context(capture.native_transport())
+        else:
+            import httpx2
+
+            client = httpx2.AsyncClient
+            stack.enter_context(
+                patch.object(
+                    httpx2,
+                    "AsyncClient",
+                    lambda **kw: client(
+                        transport=httpx2.MockTransport(capture.worker_http), **kw
+                    ),
+                )
+            )
+
+        async def query():
+            return await mys_api.endpoint_request(
+                DAILY_NOTE,
+                uid,
+                params={"role_id": uid, "server": "cn_gf01"},
+                ds_mode="none",
+            )
+
+        try:
+            await query()
+        except IndexError:
+            assert not capture.calls
+        else:
+            raise AssertionError("malformed device data did not raise the native error")
+        await GsUser.update_data_by_uid_without_bot_id(
+            uid, device_info="fixture/model/os/build"
+        )
+        external = await query()
+    assert external == capture.payload and len(capture.calls) == 1
+    assert capture.calls[0]["method"] == "GET"
+    assert capture.calls[0]["owner_cookie"] and not capture.calls[0]["signed"]
+    assert capture.calls[0]["query"] == {"role_id": uid, "server": "cn_gf01"}
+    values = [
+        row.user_id,
+        row.bot_id,
+        row.device_info,
+        await mys_api.get_uid(alias, "gs"),
+        await mys_api.get_ck(alias, "OWNER", "gs") == session,
+        await GsUser.get_user_stoken_by_uid(uid),
+        await GsUser.update_data_by_uid_without_bot_id(
+            uid, stoken="replacement-from-local-test"
+        ),
+        await mys_api.get_stoken(alias, "gs") == "replacement-from-local-test",
+        await GsUser.delete_user_data_by_uid(uid),
+        await mys_api.get_ck(alias, "OWNER", "gs"),
+    ]
+    assert values[:6] == ["actor", "adapter", "fixture/model", uid, True, None]
+    assert values[6:] == [0, True, True, None]
+    headers = capture.prepared[0]
+    application = {
+        k: v
+        for k, v in headers.items()
+        if k.startswith("x-") or k in ("referer", "origin", "user-agent")
+    }
+    return {
+        "model": values,
+        "wire": capture.calls[0],
+        "application_headers": application,
+        "malformed_device": "IndexError",
+        "response": external,
+    }
+
+
 async def bind_lifecycle(bind):
     actor, adapter = "uid-owner", "uid-adapter"
     first, second = "000000284", "000000285"
@@ -238,6 +333,7 @@ async def child(kind, source, worker):
             "observations": await business(models, base),
             "preferences": await presentation(models),
             "numeric_uids": await bind_lifecycle(models.WavesBind),
+            "account_rows": await account_rows(native=True),
         }
     sys.path.insert(0, str(worker))
     import plugin_bindings
@@ -279,6 +375,7 @@ async def child(kind, source, worker):
         preferences=False,
         uid_read=True,
         uid_write=False,
+        account_records=False,
     ):
         return plugin_bindings.binding_scope(
             name,
@@ -288,6 +385,7 @@ async def child(kind, source, worker):
             preferences=preferences,
             uid_read=uid_read,
             uid_write=uid_write,
+            account_records=account_records,
         )
 
     if kind == "reload":
@@ -411,7 +509,17 @@ async def child(kind, source, worker):
             models.WavesUser.insert_data("actor", "adapter", uid="11", cookie="denied")
         )
         await must_deny(asyncio.create_task(language.set_lang("actor", "jp")))
-        assert await models.WavesUser.get_user_cookie_by_uid("11") is None
+        await must_deny(models.WavesUser.get_user_cookie_by_uid("11"))
+    with actor(account_records=True):
+        records = await account_rows()
+        assert await models.WavesUser.get_user_cookie_by_uid("1102") == "fixture"
+        await must_deny(models.WavesUser.base_select_data(user_id="other"))
+        await must_deny(
+            asyncio.create_task(models.WavesUser.get_user_cookie_by_uid("1102"))
+        )
+    for name, adapter in (("other", "adapter"), ("actor", "other")):
+        with actor(name, adapter=adapter, account_records=True):
+            assert await models.WavesUser.get_user_cookie_by_uid("1102") is None
     with actor():
         await must_deny(language.set_lang("actor", "jp"))
         assert await language.get_lang("actor") == "kr"
@@ -483,6 +591,7 @@ async def child(kind, source, worker):
         "observations": observed,
         "preferences": preferences,
         "numeric_uids": numeric_uids,
+        "account_rows": records,
         "owner_checks": len(limits),
         "concurrent_increments": 2,
         "migrations": [first, repeated, failed, recovered],
@@ -563,7 +672,7 @@ def main():
     )
     if not args.child and any(
         report["native"][k] != report["loader"][k]
-        for k in ("observations", "preferences", "numeric_uids")
+        for k in ("observations", "preferences", "numeric_uids", "account_rows")
     ):
         raise SystemExit("native/loader model results differ")
 

@@ -20,6 +20,7 @@ class Owner:
     preferences: bool = False
     uid_read: bool = True
     uid_write: bool = False
+    account_records: bool = False
 
 
 _current = ContextVar("binding_owner", default=None)
@@ -36,6 +37,7 @@ def binding_scope(
     preferences=False,
     uid_read=True,
     uid_write=False,
+    account_records=False,
 ):
     owner = Owner(
         actor,
@@ -45,6 +47,7 @@ def binding_scope(
         preferences=preferences,
         uid_read=uid_read,
         uid_write=uid_write,
+        account_records=account_records,
     )
     try:
         owner.task = asyncio.current_task()
@@ -132,11 +135,28 @@ class GsBind:
 
     @classmethod
     async def select_data(cls, user_id, bot_id=None):
+        owner = _current.get()
+        if bot_id is None and owner is not None:
+            bot_id = owner.adapter
         with _transaction(cls, user_id, bot_id) as db:
             row = db.execute(
                 "SELECT * FROM bindings WHERE user_id=? AND bot_id=?", (user_id, bot_id)
             ).fetchone()
             return SimpleNamespace(**dict(row)) if row else None
+
+    @classmethod
+    async def bind_exists(cls, user_id, bot_id):
+        return bool(await cls.select_data(user_id, bot_id))
+
+    @classmethod
+    async def get_bind_group_list(cls, user_id, bot_id):
+        row = await cls.select_data(user_id, bot_id)
+        return row.group_id.split("_") if row and row.group_id else []
+
+    @classmethod
+    async def get_bind_group(cls, user_id, bot_id):
+        groups = await cls.get_bind_group_list(user_id, bot_id)
+        return groups[0] if groups else None
 
     @classmethod
     async def update_data(cls, user_id, bot_id, **data):

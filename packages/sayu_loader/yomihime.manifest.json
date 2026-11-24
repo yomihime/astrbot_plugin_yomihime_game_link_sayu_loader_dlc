@@ -56,6 +56,26 @@
           "invocation_policy": "command_only",
           "effect": "write",
           "privacy_floor": "owner"
+        },
+        {
+          "capability_id": "account",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "write",
+          "privacy_floor": "owner"
         }
       ],
       "commands": [
@@ -74,6 +94,14 @@
           "parameter_mode": "raw_tail",
           "raw_tail_parameter": "text",
           "help_text": "在私聊接收上游文本或图片"
+        },
+        {
+          "operation_path": "account",
+          "capability_id": "account",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "在私聊管理当前用户的插件账户记录"
         }
       ]
     },
@@ -126,6 +154,26 @@
           "invocation_policy": "command_only",
           "effect": "write",
           "privacy_floor": "owner"
+        },
+        {
+          "capability_id": "account",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "write",
+          "privacy_floor": "owner"
         }
       ],
       "commands": [
@@ -144,6 +192,14 @@
           "parameter_mode": "raw_tail",
           "raw_tail_parameter": "text",
           "help_text": "在私聊接收上游文本或图片"
+        },
+        {
+          "operation_path": "account",
+          "capability_id": "account",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "在私聊管理当前用户的插件账户记录"
         }
       ]
     },
@@ -176,6 +232,26 @@
           "invocation_policy": "command_only",
           "effect": "write",
           "privacy_floor": "owner"
+        },
+        {
+          "capability_id": "account",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "invocation_policy": "command_only",
+          "effect": "write",
+          "privacy_floor": "owner"
         }
       ],
       "commands": [
@@ -186,6 +262,14 @@
           "parameter_mode": "raw_tail",
           "raw_tail_parameter": "text",
           "help_text": "在私聊执行已加载的鸣潮上游查询指令"
+        },
+        {
+          "operation_path": "account",
+          "capability_id": "account",
+          "parameter_mapping": {},
+          "parameter_mode": "raw_tail",
+          "raw_tail_parameter": "text",
+          "help_text": "在私聊管理当前用户的插件账户记录"
         }
       ]
     }

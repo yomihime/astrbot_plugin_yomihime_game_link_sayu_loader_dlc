@@ -11,6 +11,8 @@ from image_assets import BASE
 
 PATH = "gsuid_core/utils/database/base_models.py"
 DIGEST = "b8f734e4c17f67a58f7ca02ac6ff9d3a8eba6b886701905303e74be0211daba2"
+ACCOUNT_PATH = "gsuid_core/utils/database/models.py"
+ACCOUNT_DIGEST = "83a2f078e6373106b62519c48b958e937d13dc956a42f08405b088dbcecbcb4a"
 CLASSES = ("BaseIDModel", "BaseBotIDModel", "BaseModel", "Bind", "User")
 PRELUDE = '''"""Five native SQLModel classes from Genshin-bots/gsuid_core, commit
 96cd7353be3100ff982bccc33e554961837c778e. Source gsuid_core/utils/database/base_models.py.
@@ -36,15 +38,19 @@ _db_type = "sqlite"
 '''
 
 
-def verified_orm_models(reference=None):
+def _verified_source(reference, path, digest):
     if reference is not None and Path(reference).is_dir():
-        raw = (Path(reference) / PATH).read_bytes()
+        raw = (Path(reference) / path).read_bytes()
     else:
-        with urlopen(BASE + PATH, timeout=30) as stream:
+        with urlopen(BASE + path, timeout=30) as stream:
             raw = stream.read(256 * 1024)
-    if hashlib.sha256(raw).hexdigest() != DIGEST:
+    if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("native SQLModel declarations checksum mismatch")
-    source = raw.decode("utf-8")
+    return raw.decode("utf-8")
+
+
+def verified_orm_models(reference=None):
+    source = _verified_source(reference, PATH, DIGEST)
     names = ("_mapped_column", *CLASSES)
     nodes = {
         node.name: node
@@ -76,4 +82,23 @@ def verified_orm_models(reference=None):
                     f"missing dependency for native SQLModel declarations: {key}"
                 )
         todo.extend(scope.get_children())
-    return {"plugin_orm_models.py": body.encode("utf-8")}
+    accounts = _verified_source(reference, ACCOUNT_PATH, ACCOUNT_DIGEST)
+    declarations = [
+        ast.get_source_segment(accounts, cls)
+        for cls in ast.parse(accounts).body
+        if isinstance(cls, ast.ClassDef) and cls.name in ("GsUser", "GsUID")
+    ]
+    if len(declarations) != 2:
+        raise ValueError("missing native account declarations")
+    account_models = (
+        '"""Pinned gsuid_core account declarations. GPL-3.0, see licenses/gsuid_core-COPYING.txt."""\n'
+        "from typing import Optional\nfrom sqlmodel import Field, select, update, or_\n"
+        "from sqlalchemy.ext.asyncio import AsyncSession\n"
+        "from plugin_orm import with_session\nfrom plugin_orm_models import BaseIDModel, User\n\n"
+        + "\n\n".join(declarations)
+        + "\n"
+    )
+    return {
+        "plugin_orm_models.py": body.encode("utf-8"),
+        "plugin_account_models.py": account_models.encode("utf-8"),
+    }

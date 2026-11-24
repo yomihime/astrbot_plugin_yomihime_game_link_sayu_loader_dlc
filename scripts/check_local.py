@@ -218,6 +218,7 @@ async def check(core, cases, list_commands=False):
             1,
             adapter_id="fixture",
             capability_id="direct",
+            conversation_kind=sdk.InvocationConversationKind.DIRECT,
         )
         bound = AsyncMock(return_value=SimpleNamespace(invocation=issued))
         with patch.object(

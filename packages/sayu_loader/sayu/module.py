@@ -89,58 +89,92 @@ class Module:
         self.process = None
         self.salt = os.urandom(32)
         self.lifecycle = asyncio.Lock()
+        self.binding = None
+        self.recovery = None
+        self.retiring = None
+        self.active_exchange = None
 
     def handlers(self):
         # The original Waves query is owner-scoped. Public routes also expose
         # the SDK owner transport for copyable replies in a direct conversation.
         public = self.key != "waves"
-        handlers = {"query": Command(self, "query", not public)}
+        handlers = {
+            "query": Command(self, "query", not public),
+            "account": Command(self, "account", True),
+        }
         if public:
             handlers["direct"] = Command(self, "direct", True)
         return ygl.ModuleHandlers(handlers, {}, {})
 
+    async def _launch(self, binding):
+        folder = tempfile.TemporaryDirectory(prefix="sayu-generation-")
+        root = Path(folder.name)
+        staging = asyncio.create_task(asyncio.to_thread(stage, binding, root))
+        process = None
+        try:
+            await asyncio.shield(staging)
+            exe, *_, data = binding
+            spawning = asyncio.create_task(spawn(exe, root, data))
+            try:
+                process = await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                process = await spawning
+                raise
+            async with asyncio.timeout(60):
+                hello = await read_frame(process)
+            if hello.get("ready") is not True:
+                raise RuntimeError(
+                    f"worker startup failed: {hello.get('error')} ({hello.get('type')})"
+                )
+            salt = await asyncio.to_thread(profile_salt, data)
+            return folder, process, salt
+        except BaseException:
+            await asyncio.gather(staging, return_exceptions=True)
+            if process is not None:
+                await close_worker(process, abort=True)
+            folder.cleanup()
+            raise
+
     async def start(self):
         async with self.lifecycle:
-            if self.generation is not None:
-                return
-            folder = tempfile.TemporaryDirectory(prefix="sayu-generation-")
-            staging = asyncio.create_task(
-                asyncio.to_thread(stage, WORKERS[self.key], Path(folder.name))
+            if self.generation is None:
+                binding = tuple(WORKERS[self.key])
+                self.generation, self.process, self.salt = await self._launch(binding)
+                self.binding = binding
+
+    async def _restore(self, revision):
+        if self.retiring is not None:
+            await asyncio.shield(self.retiring)
+        if revision != self.revision or self.generation is None:
+            raise ygl.ServiceUnavailable()
+        previous = self.generation
+        self.generation, self.process, self.salt = await self._launch(self.binding)
+        previous.cleanup()
+
+    def _begin_recovery(self):
+        if self.recovery is None or self.recovery.done():
+            self.recovery = asyncio.create_task(self._restore(self.revision))
+            # Recovery may finish between commands with no waiter.
+            self.recovery.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
             )
-            try:
-                await asyncio.shield(staging)
-                root = Path(folder.name)
-                exe, *_, data = WORKERS[self.key]
-                spawning = asyncio.create_task(spawn(exe, root, data))
-                try:
-                    self.process = await asyncio.shield(spawning)
-                except asyncio.CancelledError:
-                    self.process = await spawning
-                    raise
-                async with asyncio.timeout(60):
-                    hello = await read_frame(self.process)
-                if hello.get("ready") is not True:
-                    raise RuntimeError(
-                        f"worker startup failed: {hello.get('error')} ({hello.get('type')})"
-                    )
-                self.salt = await asyncio.to_thread(profile_salt, data)
-            except BaseException:
-                await asyncio.gather(staging, return_exceptions=True)
-                if self.process is not None:
-                    await close_worker(self.process, abort=True)
-                    self.process = None
-                folder.cleanup()
-                raise
-            self.generation = folder
+        return self.recovery
 
     async def stop(self):
         async with self.lifecycle:
             generation, self.generation = self.generation, None
             self.revision += 1
-            pending = tuple(self.tasks)
+            pending = set(self.tasks)
+            if self.active_exchange is not None:
+                pending.add(self.active_exchange)
+            if self.recovery is not None:
+                pending.add(self.recovery)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+            if self.retiring is not None:
+                await self.retiring
+            self.recovery = self.retiring = self.binding = None
             process, self.process = self.process, None
             try:
                 if process is not None:
@@ -161,33 +195,58 @@ class Module:
         )
 
     async def exchange(self, request, *, owner_context=None):
+        revision = self.revision
         async with self.io:
-            process = self.process
-            if (
-                self.generation is None
-                or process is None
-                or process.returncode is not None
-            ):
+            if self.generation is None or revision != self.revision:
                 raise ygl.ServiceUnavailable()
-            if owner_context is not None:
-                # Recheck Core's live owner proof after waiting for the worker.
-                scope = await self.services.scopes.bind(owner_context)
-                if scope.invocation is not owner_context:
-                    raise ygl.AccessDenied()
-                request = {**request, "owner_action": True}
-            encoded = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
-            if len(encoded) > 16384:
-                raise ValueError("worker request too large")
+            self.active_exchange = asyncio.current_task()
             try:
-                process.stdin.write(encoded)
-                await process.stdin.drain()
-                return await read_frame(process)
-            except BaseException:
-                # An interrupted read can leave a response in flight. Retire the
-                # transport before releasing the lock so no caller receives it.
-                self.process = None
-                await close_worker(process, abort=True)
-                raise
+                if self.process is None or self.process.returncode is not None:
+                    try:
+                        await asyncio.shield(self._begin_recovery())
+                    except (RuntimeError, OSError, EOFError, ValueError) as exc:
+                        raise ygl.ServiceUnavailable() from exc
+                # This bit is minted only after binding the live SDK invocation.
+                request = {k: v for k, v in request.items() if k != "owner_action"}
+                if owner_context is not None:
+                    # Recheck Core's live owner proof after waiting for the worker.
+                    scope = await self.services.scopes.bind(owner_context)
+                    if (
+                        scope.invocation is not owner_context
+                        or getattr(owner_context, "origin", None) != "command"
+                        or getattr(owner_context, "parent_id", None) is not None
+                        or request.get("private_image") is not True
+                        or request.get("capability_id")
+                        != getattr(owner_context, "capability_id", None)
+                        or request.get("event") != self.event(owner_context, True)
+                    ):
+                        raise ygl.AccessDenied()
+                    request = {**request, "owner_action": True}
+                encoded = (
+                    json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
+                )
+                if len(encoded) > 16384:
+                    raise ValueError("worker request too large")
+                process = self.process
+                if revision != self.revision or process is None:
+                    raise ygl.ServiceUnavailable()
+                try:
+                    process.stdin.write(encoded)
+                    await process.stdin.drain()
+                    return await read_frame(process)
+                except BaseException:
+                    # Delivery is indeterminate from the first write. This request
+                    # ends here. A fresh interpreter serves subsequent commands.
+                    self.process = None
+                    self.retiring = asyncio.create_task(
+                        close_worker(process, abort=True)
+                    )
+                    if self.generation is not None and revision == self.revision:
+                        self._begin_recovery()
+                    await asyncio.shield(self.retiring)
+                    raise
+            finally:
+                self.active_exchange = None
 
     def event(self, context, private=False):
         def opaque(field):
@@ -204,7 +263,7 @@ class Module:
 
         kind = getattr(context, "conversation_kind", None)
         if kind not in ("group", "direct"):
-            kind = "direct" if private else ""
+            kind = ""
         return {
             "actor_id": opaque("actor_id"),
             "conversation_kind": kind,
@@ -222,6 +281,24 @@ async def spawn(exe, generation, data):
     }
     work = str(generation)
     env.update(TMP=work, TEMP=work, TMPDIR=work)
+    if os.name == "nt":
+        executable = Path(exe).absolute()
+        config = executable.parent.parent / "pyvenv.cfg"
+        if executable.parent.name.casefold() == "scripts" and config.is_file():
+            # Windows venv's python.exe normally redirects to a second process.
+            # Launch the configured base interpreter with the same CPython venv
+            # marker so the pipe, PID, and forced retirement have one owner.
+            settings = dict(
+                (key.strip().casefold(), value.strip())
+                for line in config.read_text(encoding="utf-8").splitlines()
+                for key, sep, value in [line.partition("=")]
+                if sep
+            )
+            base = Path(settings["home"]) / executable.name
+            if not base.is_absolute() or not base.is_file():
+                raise FileNotFoundError("private base interpreter unavailable")
+            env["__PYVENV_LAUNCHER__"] = str(executable)
+            exe = str(base)
     return await asyncio.create_subprocess_exec(
         exe,
         "-I",
@@ -330,6 +407,10 @@ class Command:
         self.revision = module.revision
 
     async def document(self, context, text, parts, privacy):
+        if self.capability_id == "account":
+            # Raw account arguments can contain credentials. Asset descriptions
+            # and fallbacks only need a stable label for the private response.
+            text = "账户操作结果"
         if not isinstance(parts, list) or not 1 <= len(parts) <= 64:
             raise ValueError("invalid message chain")
         if any(isinstance(part, dict) and "poster" in part for part in parts):
@@ -467,30 +548,36 @@ class Command:
                 "event": module.event(context, self.private),
                 "private_image": privacy is ygl.Privacy.PRIVATE,
             }
-            async with asyncio.timeout(20):
-                if (
-                    self.private
-                    and getattr(context, "origin", None) == "command"
-                    and context.parent_id is None
-                    and context.capability_id == self.capability_id
-                    and context.actor_id
-                    and context.adapter_id
-                    and context.conversation_id
-                ):
-                    reply = await module.exchange(request, owner_context=context)
-                else:
-                    reply = await module.exchange(request)
-                if "error" not in reply:
-                    document = await self.document(
-                        context, text, reply["parts"], privacy
-                    )
-                    return ygl.CapabilityResult(
-                        "sayu-command",
-                        ygl.ResultStatus.SUCCESS,
-                        document,
-                        privacy=privacy,
-                    )
-                error = reply["error"]
+            # Core owns the dispatch deadline, including time spent in the worker queue.
+            owner_command = (
+                self.private
+                and getattr(context, "origin", None) == "command"
+                and context.parent_id is None
+                and context.capability_id == self.capability_id
+                and context.actor_id
+                and context.adapter_id
+                and context.conversation_id
+            )
+            if self.capability_id == "account" and (
+                not owner_command
+                or request["event"]["conversation_kind"] != "direct"
+            ):
+                raise ygl.AccessDenied()
+            if owner_command:
+                reply = await module.exchange(request, owner_context=context)
+            else:
+                reply = await module.exchange(request)
+            if "error" not in reply:
+                document = await self.document(
+                    context, text, reply["parts"], privacy
+                )
+                return ygl.CapabilityResult(
+                    "sayu-command",
+                    ygl.ResultStatus.SUCCESS,
+                    document,
+                    privacy=privacy,
+                )
+            error = reply["error"]
         except UnsupportedProjection:
             error = "unsupported_message"
         except (ygl.AccessDenied, ygl.InvalidInvocation):

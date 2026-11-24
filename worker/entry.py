@@ -87,6 +87,7 @@ class Worker:
                 preferences=owner_action,
                 uid_read=owner_action,
                 uid_write=owner_action,
+                account_records=owner_action and request["capability_id"] == "account",
             ),
         ):
             parts = await sayu_compat.dispatch(request["text"], **event)

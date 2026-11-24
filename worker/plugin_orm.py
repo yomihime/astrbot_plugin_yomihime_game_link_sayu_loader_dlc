@@ -26,6 +26,12 @@ from sqlmodel import Field, SQLModel
 from port_errors import Unsupported
 import plugin_bindings
 from plugin_orm_bind import BIND_ERROR, guard_bind, permits_bind, uid_columns
+from plugin_orm_accounts import (
+    ACCOUNT_ERROR,
+    account_columns,
+    guard_account,
+    permits_account,
+)
 from plugin_orm_preferences import (
     OWNER_ERROR,
     guard_preferences,
@@ -53,6 +59,7 @@ class Access:
     task: object
     preference: tuple[str, frozenset[str]] | None = None
     binding: tuple[str, frozenset[str]] | None = None
+    account: tuple[str, dict[str, str]] | None = None
 
     def check(self):
         if self.root is not _runtime or asyncio.current_task() is not self.task:
@@ -165,6 +172,8 @@ class PluginORM:
         self.preferences = {}
         self.bindings = {}
         self.bind_tables = set()
+        self.accounts = {}
+        self.account_tables = set()
 
     def path(self, name):
         path = self.root / name
@@ -224,6 +233,11 @@ class PluginORM:
         ):
             preference = self.preferences.get(model)
         binding = None
+        account = None
+        if not owner.writable and isinstance(model, type) and model in self.accounts:
+            account = self.accounts[model]
+            if not owner.account_records or account is None:
+                raise Unsupported(ACCOUNT_ERROR)
         if not owner.writable and isinstance(model, type) and model in self.bindings:
             binding = self.bindings[model]
             if not owner.uid_read or binding is None:
@@ -231,6 +245,7 @@ class PluginORM:
         write = not read_only and (
             owner.writable
             or preference is not None
+            or account is not None
             or (binding is not None and owner.uid_write)
         )
         if not path.exists():
@@ -239,7 +254,9 @@ class PluginORM:
                 self.clone_schema(template, path)
             else:
                 path = template
-        return Access(self, path, write, False, owner, task, preference, binding)
+        return Access(
+            self, path, write, False, owner, task, preference, binding, account
+        )
 
     def publish_empty_schema(self):
         # Plugin startup may seed records in its own store. A new actor inherits
@@ -342,7 +359,17 @@ class PluginORM:
                     access.preference, action, first, second, database, trigger
                 )
             if action in _DML or action == sqlite3.SQLITE_READ:
-                if access.binding:
+                if access.account:
+                    allowed = permits_account(
+                        access, action, first, second, database, trigger
+                    )
+                elif (
+                    not access.startup
+                    and not access.origin.writable
+                    and (first or "").casefold() in self.account_tables
+                ):
+                    allowed = False
+                elif access.binding:
                     allowed = permits_bind(
                         access, action, first, second, database, trigger
                     )
@@ -363,6 +390,8 @@ class PluginORM:
                 connection.run_async(lambda driver: guard_preferences(driver, access))
             if access.binding:
                 connection.run_async(lambda driver: guard_bind(driver, access))
+            if access.account:
+                connection.run_async(lambda driver: guard_account(driver, access))
             connection.run_async(lambda driver: driver.set_authorizer(authorize))
 
         @event.listens_for(db.sync_engine, "begin")
@@ -380,6 +409,8 @@ class PluginORM:
         try:
             yield db
         except DBAPIError as exc:
+            if access.account and str(exc.orig) == ACCOUNT_ERROR:
+                raise Unsupported(ACCOUNT_ERROR) from exc
             if access.binding and str(exc.orig) == BIND_ERROR:
                 raise Unsupported(BIND_ERROR) from exc
             if access.preference and str(exc.orig) == OWNER_ERROR:
@@ -410,6 +441,7 @@ class PluginORM:
         models = sys.modules["gsuid_core.utils.database.models"]
         base_id = sys.modules["gsuid_core.utils.database.base_models"].BaseIDModel
         bind = sys.modules["gsuid_core.utils.database.base_models"].Bind
+        user = sys.modules["gsuid_core.utils.database.base_models"].User
         tables = {models.Subscribe.__table__, models.CoreUser.__table__}
         todo = list(SQLModel.__subclasses__())
         seen = set()
@@ -421,10 +453,14 @@ class PluginORM:
             todo.extend(cls.__subclasses__())
             table = getattr(cls, "__table__", None)
             if table is not None and (
-                cls.__module__.startswith(prefix)
+                cls in (models.GsUser, models.GsUID)
+                or cls.__module__.startswith(prefix)
                 or cls.__module__ in (self.plugin, "plugins." + self.plugin)
             ):
                 tables.add(table)
+                if issubclass(cls, user) or cls is models.GsUID:
+                    self.accounts[cls] = account_columns(table)
+                    self.account_tables.add(table.name.casefold())
                 if issubclass(cls, bind):
                     self.bindings[cls] = uid_columns(table)
                     self.bind_tables.add(table.name.casefold())
@@ -500,6 +536,7 @@ class PluginORM:
 def install_orm(package, data_root, plugin):
     global _runtime
     import plugin_orm_models as native
+    from plugin_account_models import GsUser, GsUID
     from plugin_core_user import CoreUser
 
     class Subscribe(native.BaseModel, table=True):
@@ -535,6 +572,7 @@ def install_orm(package, data_root, plugin):
     base.engine = SimpleNamespace(begin=_runtime.begin, connect=_runtime.connect)
     package("gsuid_core.utils.database.startup").exec_list = _runtime.migrations
     models = sys.modules["gsuid_core.utils.database.models"]
+    models.GsUser, models.GsUID = GsUser, GsUID
     models.Subscribe = Subscribe
     models.CoreUser = CoreUser
     return _runtime

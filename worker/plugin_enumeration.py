@@ -102,7 +102,7 @@ def install_enumeration(models, *, admins=(), read_rows=None):
                         result.extend(value.split("_"))
             return result
 
-    class ProfileUser(models.GsUser):
+    class InventoryQueries:
         @classmethod
         async def get_all_data(cls):
             return authority.rows("users", cls)
@@ -154,6 +154,18 @@ def install_enumeration(models, *, admins=(), read_rows=None):
                 row for row in await cls.get_all_user() if getattr(row, column) != "off"
             ]
 
-    models.GsBind, models.GsUser = ProfileBind, ProfileUser
+    # SQLAlchemy must keep the original mapped class for row hydration and column
+    # expressions. Only replace its profile-wide queries with the admin port.
+    if hasattr(models.GsUser, "__table__"):
+        for name, method in vars(InventoryQueries).items():
+            if isinstance(method, classmethod):
+                setattr(models.GsUser, name, method)
+    else:
+
+        class ProfileUser(InventoryQueries, models.GsUser):
+            pass
+
+        models.GsUser = ProfileUser
+    models.GsBind = ProfileBind
     _installed = authority._generation
     return authority
