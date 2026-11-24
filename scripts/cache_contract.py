@@ -246,8 +246,9 @@ def main():
             spec = json.loads((build_local.ROOT / "profiles/lock.json").read_bytes())[
                 "genshin"
             ]
-            archive = temp / "worker.pyz"
-            archive.write_bytes(build_local.worker_archive(spec, offline=True))
+            archive = opts.worker.resolve() if opts.worker else temp / "worker.pyz"
+            if opts.worker is None:
+                archive.write_bytes(build_local.worker_archive(spec, offline=True))
             report = {
                 "reference_commit": REFERENCE_COMMIT,
                 "reference_files": sources,

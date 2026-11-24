@@ -25,3 +25,9 @@ Core 的独立候选在现有分派入口为前台保留容量，统一处理排
 候选 20 的原神武器材料回调还需要匿名动态查询。MiniGG 依次用名称、语言和等级查询资料，返回值参与原包的下一次请求。现有静态资源清单无法表达这条链路。可先验证经已声明来源调用 SDK 的 `scope.http.fetch`，再将经过约束的 GET 结果、HTTP 错误和取消送回发起请求的 worker。验收应观察这两次请求及回包，另测未经声明的主机、重定向和凭据头。是否需要扩展 Core 取决于现有 SDK 能否支持这次双向调用。
 
 真实 WebChat 的测试、内存适配器的原生对照和只有源码定位的项目分别列在[整包对照记录](package-oracle.md)及[契约清单](plugin-contract.md)。原生在普通聊天中返回原始账户列表的行为与 YGL 的用户隔离要求有直接冲突，需要宿主产品决策。
+
+### 已验证的玩家来源接口
+
+独立 Core 分支提供 `accounts.confirm_player_login` 和 `scope.http.fetch_player`。受信宿主把一个私聊能力绑定到命名来源和固定 GET 路径；外部签发方核验后，Core 才为当前玩家保存可撤销凭据。隔离测试经真正的 CoreRuntime、独立 DLC、回环 TLS 与 SQLite，核对了两名玩家、错用途、重复确认、连接等待或响应期间撤销，以及写入密文后取消。这个分支的 79 项测试已通过。现场候选 22 使用的是调度分支。两个改动独立审查。[玩家授权草案 #35](https://github.com/yomihime/astrbot_plugin_yomihime_game_link/pull/35) · [调度草案 #34](https://github.com/yomihime/astrbot_plugin_yomihime_game_link/pull/34)
+
+三个原包的账号请求仍有具体差异。原神、星铁的状态 GET 需要角色和区服查询参数、玩家 Cookie 及服务认可的请求证明；鸣潮获取角色列表需要 POST 表单及该玩家的访问与设备字段。固定 Bearer GET 在构建这些请求时就会拒绝，普通来源读取也无权注入上述玩家凭据。接入还需要由受信方确认角色、允许的方法、参数和凭据用途，并保留发送前撤销及响应交付检查。现场不具备这些能力。
