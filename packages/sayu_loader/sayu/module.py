@@ -414,13 +414,14 @@ class Command:
         if not isinstance(parts, list) or not 1 <= len(parts) <= 64:
             raise ValueError("invalid message chain")
         if any(isinstance(part, dict) and "poster" in part for part in parts):
+            audience = ygl.Privacy.PRIVATE if self.private else ygl.Privacy.PUBLIC
             if (
-                privacy is not ygl.Privacy.PUBLIC
+                privacy is not audience
                 or len(parts) != 1
                 or parts[0].keys() != {"poster"}
             ):
                 raise UnsupportedProjection(
-                    "image pages require one public source image"
+                    "image pages require one supported audience and a single poster"
                 )
             poster = parts[0]["poster"]
             if not isinstance(poster, dict) or poster.keys() != {
@@ -428,7 +429,7 @@ class Command:
                 "height",
                 "tiles",
             }:
-                raise UnsupportedProjection("invalid public image pages")
+                raise UnsupportedProjection("invalid image pages")
             width, height, tiles = poster["width"], poster["height"], poster["tiles"]
             if (
                 type(width) is not int
@@ -439,14 +440,14 @@ class Command:
                     and width * height <= 8_000_000
                 )
             ):
-                raise UnsupportedProjection("invalid public image dimensions")
+                raise UnsupportedProjection("invalid image dimensions")
             grid_width = max(400, width)
             columns = max(8, (grid_width + 95) // 96)
             cell_width = (grid_width + columns - 1) // columns
             cell_height = 128
             expected = columns * ((height + cell_height - 1) // cell_height)
             if not isinstance(tiles, list) or len(tiles) != expected or expected > 1000:
-                raise UnsupportedProjection("incomplete public image")
+                raise UnsupportedProjection("incomplete image")
             items = []
             total = 0
             for i, encoded in enumerate(tiles):
@@ -459,7 +460,7 @@ class Command:
                     or int.from_bytes(raw[16:20], "big") != cell_width
                     or int.from_bytes(raw[20:24], "big") != cell_height
                 ):
-                    raise UnsupportedProjection("invalid public image tile")
+                    raise UnsupportedProjection("invalid image tile")
                 items.append(
                     ygl.cards.DenseCollageItem(
                         str(i + 1), 1, ygl.cards.Asset("png", raw)

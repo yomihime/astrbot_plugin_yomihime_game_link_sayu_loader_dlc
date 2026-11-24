@@ -1,7 +1,8 @@
-"""Fit bounded static images to public card assets or the owner-scoped PNG transport."""
+"""Fit bounded static images to public cards and owner-scoped image transports."""
 
 import base64
 import binascii
+import re
 from io import BytesIO
 from math import ceil, sqrt
 
@@ -40,7 +41,73 @@ def _scaled_size(size, scale):
     return tuple(max(1, int(length * scale)) for length in size)
 
 
-def _decode(encoded, remaining_pixels=MAX_INPUT_PIXELS, *, single_budget=None):
+def _single_scan_jpeg(raw):
+    """Accept a baseline, single interleaved scan that libjpeg decodes sequentially."""
+    # A progressive or multi-scan decoder can retain full-resolution coefficient
+    # planes even when draft() reduces its output. Only admit the bounded path.
+    offset = 2
+    components = None
+    for _ in range(1024):
+        if offset + 4 > len(raw) or raw[offset] != 0xFF:
+            return False
+        marker = raw[offset + 1]
+        length = int.from_bytes(raw[offset + 2 : offset + 4], "big")
+        end = offset + 2 + length
+        if length < 2 or end > len(raw):
+            return False
+        if marker == 0xC0:
+            if components is not None or length < 11 or raw[offset + 4] != 8:
+                return False
+            components = raw[offset + 9]
+            if components not in (1, 3) or length != 8 + 3 * components:
+                return False
+        elif marker == 0xDA:
+            if components is None or length != 6 + 2 * components:
+                return False
+            if raw[offset + 4] != components or raw[end - 3 : end] != b"\x00\x3f\x00":
+                return False
+            marker = _SCAN_END.search(raw, end)
+            return (
+                marker is not None
+                and marker.start() == len(raw) - 2
+                and raw[-1] == 0xD9
+            )
+        elif marker not in (0xC4, 0xDB, 0xDD, 0xFE) and not 0xE0 <= marker <= 0xEF:
+            return False
+        offset = end
+    return False
+
+
+_SCAN_END = re.compile(rb"\xff[^\x00\xd0-\xd7\xff]")
+
+
+def _draft_poster(image, raw, remaining_pixels):
+    width, height = image.size
+    half = ((width + 1) // 2, (height + 1) // 2)
+    if (
+        image.format != "JPEG"
+        or image.mode not in ("L", "RGB")
+        or height <= max(1024, width)
+        or half[0] > 1536
+        or half[1] > MAX_HEIGHT
+        or half[0] * half[1] > min(remaining_pixels, PUBLIC_PIXELS)
+        or not _single_scan_jpeg(raw)
+    ):
+        raise UnsupportedMessage("image exceeds source pixel limit")
+    # draft must precede every load/convert/resize. Never allocate the declared
+    # full raster; check the decoder's actual destination before it runs.
+    image.draft(image.mode, (max(1, width // 2), max(1, height // 2)))
+    if image.size != half:
+        raise UnsupportedMessage("decoder did not select readable half resolution")
+
+
+def _decode(
+    encoded,
+    remaining_pixels=MAX_INPUT_PIXELS,
+    *,
+    single_budget=None,
+    allow_reduced=False,
+):
     if not isinstance(encoded, str) or len(encoded) > 4 * (
         (MAX_INPUT_IMAGE_BYTES + 2) // 3
     ):
@@ -50,21 +117,30 @@ def _decode(encoded, remaining_pixels=MAX_INPUT_PIXELS, *, single_budget=None):
         if len(raw) > MAX_INPUT_IMAGE_BYTES:
             raise UnsupportedMessage("image exceeds source byte limit")
         with Image.open(BytesIO(raw), formats=("JPEG", "PNG")) as image:
+            reduced = False
             if image.width * image.height > remaining_pixels:
                 from rendered_images import generated
 
-                if single_budget is None or not generated(raw, image.size):
+                if single_budget is not None and generated(raw, image.size):
+                    _fit_scale(*image.size, *single_budget)
+                elif allow_reduced:
+                    _draft_poster(image, raw, remaining_pixels)
+                    reduced = True
+                else:
                     raise UnsupportedMessage("image exceeds source pixel limit")
-                # Check recipient readability against the original dimensions
-                # before allocating or resampling an authenticated local canvas.
-                _fit_scale(*image.size, *single_budget)
             if getattr(image, "is_animated", False):
                 raise UnsupportedMessage("animated images cannot be projected")
+            if reduced:
+                # A draft JPEG already has a canonical L or RGB raster. Decode in
+                # place; convert() would keep a second full output buffer alive.
+                image.load()
+                image.info.clear()
+                return image, len(raw), True
             has_alpha = "A" in image.getbands() or "transparency" in image.info
             clean = image.convert("RGBA" if has_alpha else "RGB")
             # The scoped transport validates a PNG containing just IHDR, IDAT and IEND.
             clean.info.clear()
-            return clean, len(raw)
+            return clean, len(raw), False
     except UnsupportedMessage:
         raise
     except (ValueError, binascii.Error, OSError, Image.DecompressionBombError) as exc:
@@ -112,14 +188,14 @@ def prepare_public_parts(parts, source, package):
             continue
         if part.keys() != {"image"}:
             raise UnsupportedMessage("unknown public message part")
-        image, byte_count = _decode(
+        image, byte_count, _ = _decode(
             part["image"],
             remaining_pixels,
             single_budget=(PUBLIC_SIDE, PUBLIC_SIDE, PUBLIC_PIXELS),
         )
         remaining_pixels -= image.width * image.height
         if len(parts) == 1 and image.height > max(1024, image.width):
-            return [_public_poster(image)]
+            return [_poster(image)]
         scale = _fit_scale(*image.size, PUBLIC_SIDE, PUBLIC_SIDE, PUBLIC_PIXELS)
         if scale == 1.0 and byte_count <= PUBLIC_BYTES:
             result.append(part)
@@ -130,8 +206,8 @@ def prepare_public_parts(parts, source, package):
     return result
 
 
-def _public_poster(image):
-    # The public paginated renderer packs equal spans in row order. A tile
+def _poster(image):
+    # The paginated renderer packs equal spans in row order. A tile
     # narrower than 108 px retains the complete image without a label overlay.
     # Resize the whole source once so adjacent tile boundaries share its pixels.
     scale = _fit_scale(*image.size, 1536, MAX_HEIGHT, PUBLIC_PIXELS)
@@ -145,7 +221,7 @@ def _public_poster(image):
     cell_height = 128
     rows = ceil(frame.height / cell_height)
     if columns * rows > 1000 or rows > 64:
-        raise UnsupportedMessage("image exceeds the public page limit")
+        raise UnsupportedMessage("image exceeds the page limit")
     tiles = []
     total = 0
     for row in range(rows):
@@ -173,7 +249,7 @@ def _public_poster(image):
             total += len(data)
             if total > MAX_BYTES:
                 raise UnsupportedMessage(
-                    "lossless public image tiles exceed the worker transport"
+                    "lossless image tiles exceed the worker transport"
                 )
             tiles.append(base64.b64encode(data).decode("ascii"))
     return {"poster": {"width": frame.width, "height": frame.height, "tiles": tiles}}
@@ -200,7 +276,7 @@ def _wrap_text(text, font, width):
 
 
 def prepare_owner_parts(parts, source, package):
-    """Return text unchanged or a single PNG containing the entire reply in order."""
+    """Preserve owner message order in text, a scoped PNG, or a paginated card."""
     return _compose(parts, source, package, public=False)
 
 
@@ -216,18 +292,24 @@ def _compose(parts, source, package, *, public):
         return parts
 
     content = []
+    reduced_source = False
+    one_image = (
+        sum(isinstance(part, dict) and part.keys() == {"image"} for part in parts) == 1
+    )
     width = height = pixel_count = 0
     has_text = False
     total_text = 0
     for part in parts:
         if isinstance(part, dict) and part.keys() == {"image"}:
-            image, _ = _decode(
+            image, _, reduced = _decode(
                 part["image"],
                 MAX_INPUT_PIXELS - pixel_count,
+                allow_reduced=one_image and not public,
                 single_budget=(MAX_WIDTH, MAX_HEIGHT, MAX_PIXELS)
                 if len(parts) == 1
                 else None,
             )
+            reduced_source |= reduced
             pixel_count += image.width * image.height
             width = max(width, image.width)
             content.append(image)
@@ -247,6 +329,8 @@ def _compose(parts, source, package, *, public):
 
     if len(content) == 1:
         image = content[0]
+        if reduced_source:
+            return [_poster(image)]
         scale = _fit_scale(*image.size, MAX_WIDTH, MAX_HEIGHT, MAX_PIXELS)
         return [_encode(image, scale, MAX_BYTES)]
 
@@ -266,7 +350,21 @@ def _compose(parts, source, package, *, public):
         else:
             layout.append((height, item))
             height += item.height
-    if public:
+    if reduced_source:
+        # draft already consumed the admissible reduction. Preserve this raster
+        # and every caption in order, accounting for both source and destination
+        # before allocating the composed canvas.
+        if (
+            width > 1536
+            or height > MAX_HEIGHT
+            or width * height > PUBLIC_PIXELS
+            or pixel_count + width * height > MAX_INPUT_PIXELS
+        ):
+            raise UnsupportedMessage(
+                "captioned poster exceeds the composite pixel budget"
+            )
+        scale = 1.0
+    elif public:
         scale = _fit_scale(width, height, 640, 640, PUBLIC_PIXELS)
     else:
         scale = _fit_scale(width, height, MAX_WIDTH, MAX_HEIGHT, MAX_PIXELS)
@@ -299,6 +397,8 @@ def _compose(parts, source, package, *, public):
                     _scaled_size(item.size, scale), Image.Resampling.LANCZOS
                 )
             canvas.paste(item, ((canvas.width - item.width) // 2, int(y * scale)))
+    if reduced_source:
+        return [_poster(canvas)]
     return [
         _encode(
             canvas,
