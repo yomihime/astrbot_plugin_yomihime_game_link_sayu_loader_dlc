@@ -43,6 +43,11 @@ def static_httpx(profile, reader):
         transfer_window,
     )
 
+    reads = {}
+    if getattr(profile, "MODULE_ROUTE", None):
+        from anonymous_sources import SOURCES, target
+
+        reads = {target(spec): source for source, spec in SOURCES.get(profile.MODULE_ROUTE, {}).items()}
     original = httpx.AsyncClient
     # Use the pinned client's own default headers, including its installed codecs.
     # An explicitly supplied transport keeps this unconnected client pool-free.
@@ -127,7 +132,8 @@ def static_httpx(profile, reader):
                 self.blocked
                 or request.method != "GET"
                 or (
-                    url not in objects
+                    url not in reads
+                    and url not in objects
                     and url not in profile.STATIC_RESOURCE_URLS
                     and url not in getattr(profile, "PUBLISHED_IMAGE_DIGESTS", {})
                     and not ambr_asset(url)
@@ -145,6 +151,11 @@ def static_httpx(profile, reader):
                 raise Unsupported("streamed resource requests are unavailable") from exc
             if body:
                 raise Unsupported("resource GET must not contain a body")
+            if url in reads:
+                # This marked request never enters the static asset broker.
+                from anonymous_http import get
+
+                return httpx.Response(200, content=await get(reads[url], request.extensions.get("timeout", {})))
             record = {
                 "origin": request.url.host,
                 "asset_sha256": sha256(url.encode()).hexdigest(),

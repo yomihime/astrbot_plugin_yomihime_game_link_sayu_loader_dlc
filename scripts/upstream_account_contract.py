@@ -249,7 +249,7 @@ async def native(work, package, libraries, lifecycle, include_core_login=False):
 
 
 @asynccontextmanager
-async def loader(work, key, lifecycle):
+async def loader(work, key, lifecycle, anonymous=None):
     archive = work / "worker.pyz"
     sys.path.insert(0, str(archive))
     entry = runpy.run_path(str(archive), run_name="worker_account_fixture")
@@ -293,7 +293,11 @@ async def loader(work, key, lifecycle):
                 "conversation_id": "fixture-group" if group else actor,
             },
         }
-        reply = await worker.handle(request)
+        if anonymous is None:
+            reply = await worker.handle(request)
+        else:
+            with anonymous.invocation():
+                reply = await worker.handle(request)
         return [compact(k, v) for p in reply["parts"] for k, v in p.items()]
 
     try:
@@ -359,7 +363,17 @@ def install_loader_io(stack, work):
 
 
 async def child(
-    key, mode, work, libraries, stack, lifecycle, include_core_login=False, stored=False
+    key,
+    mode,
+    work,
+    libraries,
+    stack,
+    lifecycle,
+    include_core_login=False,
+    stored=False,
+    public_http_core=None,
+    public_http_package=None,
+    public_http_sha=None,
 ):
     if mode == "loader":
         lifecycle["resource_broker"] = install_loader_io(stack, work)
@@ -554,8 +568,20 @@ async def child(
             return Response({"code": 200, "data": {}})
         return Response({"code": 400, "msg": "fixture has no panel data"})
 
+    anonymous = None
+    if public_http_core:
+        from anonymous_account_fixture import OfflineReads
+
+        worker_hash = hashlib.sha256((work / "worker.pyz").read_bytes()).hexdigest()
+        anonymous = OfflineReads(
+            public_http_core,
+            public_http_package or ROOT,
+            hits,
+            digest=public_http_sha,
+            worker_hash=worker_hash,
+        )
     backend = (
-        loader(work, key, lifecycle)
+        loader(work, key, lifecycle, anonymous)
         if mode == "loader"
         else native(
             work, LOCK[key]["package"], libraries, lifecycle, include_core_login
@@ -660,7 +686,19 @@ async def child(
                         assert (
                             "<fixture-token>" not in str(denied[flag]) and not hits
                         ), (flag, denied[flag], hits)
+            if anonymous is not None:
+                account_read_count = anonymous.count
+                fallback_proof = await anonymous.check_fallbacks()
     return {
+        **(
+            {
+                "sdk_public_reads": account_read_count,
+                "public_read_contract": fallback_proof,
+                "host_package": public_http_sha,
+            }
+            if anonymous
+            else {}
+        ),
         "cases": rows,
         "lifecycle": lifecycle,
         "sampled_background_httpx2": startup_http,
@@ -895,6 +933,17 @@ def main():
         help="seed the owner's synthetic GsUser row through the public model in a normal account request",
     )
     parser.add_argument("--libraries", type=Path)
+    parser.add_argument(
+        "--public-http-package",
+        type=Path,
+        help="exact host DLC ZIP containing this worker binding",
+    )
+    parser.add_argument("--public-http-sha256", help="digest of the host DLC ZIP")
+    parser.add_argument(
+        "--public-http-core",
+        type=Path,
+        help="exercise the worker GET channel with real SDK policy and an offline fixture origin",
+    )
     parser.add_argument("--native-result", type=Path)
     parser.add_argument("--loader-result", type=Path)
     parser.add_argument("--offline-result", type=Path)
@@ -903,6 +952,14 @@ def main():
     )
     parser.add_argument("--worker-sha256", help="expected hex digest of --worker")
     args = parser.parse_args()
+    if bool(args.public_http_package) != bool(args.public_http_sha256) or (
+        args.public_http_package and not args.public_http_core
+    ):
+        parser.error(
+            "the public HTTP package and digest must accompany the Core fixture"
+        )
+    if args.public_http_core and (args.mode != "loader" or args.profile != "waves"):
+        parser.error("--public-http-core requires the Waves Loader")
     if args.mys_stored:
         args.mys_session = True
     if args.mys_session and (args.profile == "waves" or args.mode == "policy"):
@@ -957,6 +1014,9 @@ def main():
                         lifecycle,
                         args.mys_session,
                         args.mys_stored,
+                        args.public_http_core,
+                        args.public_http_package,
+                        args.public_http_sha256,
                     )
                 )
             except Exception as exc:
@@ -1045,6 +1105,21 @@ def main():
                 str(Path(__file__).resolve()),
                 "--child",
                 *(["--mys-session"] if args.mys_session else []),
+                *(
+                    [
+                        "--public-http-package",
+                        str(args.public_http_package.resolve()),
+                        "--public-http-sha256",
+                        args.public_http_sha256,
+                    ]
+                    if args.public_http_package
+                    else []
+                ),
+                *(
+                    ["--public-http-core", str(args.public_http_core.resolve())]
+                    if args.public_http_core
+                    else []
+                ),
                 *(["--mys-stored"] if args.mys_stored else []),
                 "--profile",
                 args.profile,

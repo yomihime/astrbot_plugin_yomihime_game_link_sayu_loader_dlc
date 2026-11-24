@@ -212,6 +212,32 @@
       "display": {
         "default_name": "XutheringWavesUID"
       },
+      "sources": [
+        {
+          "source_id": "sayu_kuro_ip",
+          "host": "event.kurobbs.com",
+          "timeout_seconds": 4,
+          "requests_per_minute": 12,
+          "requests_per_hour": 120,
+          "max_redirects": 0
+        },
+        {
+          "source_id": "sayu_ipify",
+          "host": "api.ipify.org",
+          "timeout_seconds": 4,
+          "requests_per_minute": 12,
+          "requests_per_hour": 120,
+          "max_redirects": 0
+        },
+        {
+          "source_id": "sayu_httpbin",
+          "host": "httpbin.org",
+          "timeout_seconds": 4,
+          "requests_per_minute": 12,
+          "requests_per_hour": 120,
+          "max_redirects": 0
+        }
+      ],
       "capabilities": [
         {
           "capability_id": "query",

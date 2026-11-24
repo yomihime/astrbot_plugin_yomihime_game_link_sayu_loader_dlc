@@ -37,6 +37,15 @@ for line in sys.stdin:
     request=json.loads(line)
     label=request['text']
     record(label)
+    if label.startswith('anonymous-'):
+        nonce=request.get('anonymous_invocation','')
+        for i in (1,2) if label in ('anonymous-twice','anonymous-repeat') else (1,):
+            seq=1 if label=='anonymous-repeat' else i
+            send({'get':'sayu_kuro_ip','invocation':nonce,'seq':seq,'timeout_ms':4000})
+            response=json.loads(sys.stdin.readline())
+            if response['seq']!=seq:raise ValueError('mismatched reply')
+        send({'parts':[{'text':'done'}]})
+        continue
     if label=='broker':
         import atexit,resource_broker
         broker=resource_broker.activate(Path(sys.argv[0]).resolve())
@@ -61,6 +70,10 @@ def adapter(binding):
     sdk.ServiceUnavailable = type("Unavailable", (RuntimeError,), {})
     sdk.AccessDenied = type("AccessDenied", (RuntimeError,), {})
     sdk.InvalidInvocation = type("InvalidInvocation", (RuntimeError,), {})
+    sdk.HttpRequest = lambda source, path, **fields: SimpleNamespace(
+        source_id=source, path=path, **fields
+    )
+    sdk.SourceHttpError = type("SourceHttpError", (RuntimeError,), {})
     sdk.Privacy = SimpleNamespace(PRIVATE="private", PUBLIC="public")
     sdk.ErrorCode = SimpleNamespace(NOT_FOUND=1, UNSUPPORTED=2, UPSTREAM_ERROR=3)
     sdk.ModuleHandlers = lambda capabilities, *_: SimpleNamespace(
@@ -71,9 +84,16 @@ def adapter(binding):
     spec = importlib.util.spec_from_file_location(
         "recovery_fixture.sayu.module", MODULE
     )
+    subpackage = ModuleType("recovery_fixture.sayu")
+    subpackage.__path__ = [str(MODULE.parent)]
     target = importlib.util.module_from_spec(spec)
     with patch.dict(
-        sys.modules, {package.__name__: package, runtime.__name__: runtime}
+        sys.modules,
+        {
+            package.__name__: package,
+            subpackage.__name__: subpackage,
+            runtime.__name__: runtime,
+        },
     ):
         spec.loader.exec_module(target)
     return target
@@ -119,6 +139,74 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     def request(self, label):
         return self.module.exchange({"text": label})
+
+    async def test_anonymous_frames_and_cancellation(self):
+        from unittest.mock import AsyncMock
+
+        self.module.key = "waves"
+        source = AsyncMock(
+            return_value=SimpleNamespace(
+                status_code=200,
+                body=b"192.0.2.1",
+                final_url="https://event.kurobbs.com/event/ip",
+            )
+        )
+        context = SimpleNamespace(
+            module_id="sayuww", capability_id="account", deadline=None
+        )
+        scope = SimpleNamespace(invocation=context, http=SimpleNamespace(fetch=source))
+        self.module.services = SimpleNamespace(
+            scopes=SimpleNamespace(bind=AsyncMock(return_value=scope))
+        )
+
+        async def invoke(label):
+            return await self.module.exchange(
+                {"text": label, "capability_id": "account"}, invocation_context=context
+            )
+
+        self.assertEqual((await invoke("anonymous-twice"))["parts"], [{"text": "done"}])
+        self.assertEqual(source.await_count, 2)
+        with self.assertRaises(ValueError):
+            await invoke("anonymous-repeat")
+        self.assertEqual(source.await_count, 3)
+        self.assertEqual(len(self.records("anonymous-repeat")), 1)
+        await self.request("ready")
+        # An ordinary unbound exchange cannot mint a read from supplied input.
+        with self.assertRaises(ValueError):
+            await self.module.exchange(
+                {"text": "anonymous-unguarded", "anonymous_invocation": "f" * 32}
+            )
+        self.assertEqual(source.await_count, 3)
+        await self.request("ready")
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def slow(_):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        source.side_effect = slow
+        pending = asyncio.create_task(invoke("anonymous-cancel"))
+        await asyncio.wait_for(started.wait(), 2)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertTrue(cancelled.is_set())
+        await self.request("ready")
+        self.assertEqual(len(self.records("anonymous-cancel")), 1)
+        self.assertEqual(source.await_count, 4)
+        context.deadline = asyncio.get_running_loop().time() + 0.1
+        with self.assertRaises(TimeoutError):
+            await invoke("anonymous-deadline")
+        self.assertEqual(source.await_count, 5)
+        await self.request("ready")
+        with self.assertRaises(TimeoutError):
+            await invoke("anonymous-expired")
+        self.assertFalse(self.records("anonymous-expired"))
+        self.assertEqual(source.await_count, 5)
 
     async def test_command_uses_callers_deadline(self):
         from unittest.mock import AsyncMock

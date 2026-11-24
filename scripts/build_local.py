@@ -66,6 +66,9 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
     if digest(endpoint_source) != MYS_API_SHA256:
         raise ValueError("pinned native endpoint declarations differ")
     files[MYS_API_PATH] = endpoint_source
+    files["anonymous_sources.py"] = (
+        ROOT / "packages/sayu_loader/sayu/anonymous_sources.py"
+    ).read_bytes()
     license_path = "licenses/gsuid_core-COPYING.txt"
     files.update(verified_assets(LOCAL / "reference"))
     files.update(verified_cookie_input(LOCAL / "reference"))
@@ -110,6 +113,7 @@ def worker_archive(lock, *, offline=False, public_resources_only=False, snapshot
         f"PACKAGE = {lock['package']!r}\nPREFIX = {lock['prefix']!r}\n"
         f"RUNTIME_MODE = {lock.get('runtime_mode', 'package')!r}\n"
         f"OFFLINE = {offline!r}\n"
+        f"MODULE_ROUTE = {lock.get('module_id', '')!r}\n"
         f"OWNER_WRITES = {owner_writes!r}\n"
         f"PUBLIC_RESOURCES_ONLY = {public_resources_only!r}\n"
         f"STATIC_RESOURCE_URLS = {tuple(static_urls)!r}\n"

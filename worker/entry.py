@@ -158,7 +158,13 @@ async def serve(output):
             if not line.endswith(b"\n") or len(line) > 16384:
                 raise ValueError("invalid request frame")
             try:
-                reply = await worker.handle(json.loads(line))
+                from anonymous_http import read_scope
+
+                request = json.loads(line)
+                nonce = request.pop("anonymous_invocation", None)
+                with (read_scope(nonce, lambda frame: send(output, frame))
+                      if nonce is not None else nullcontext()):
+                    reply = await worker.handle(request)
             except Exception as exc:
                 reply = {"error": error_code(exc)}
             send(output, reply)

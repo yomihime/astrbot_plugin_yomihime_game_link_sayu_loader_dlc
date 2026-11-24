@@ -13,6 +13,8 @@ from pathlib import Path, PurePosixPath
 
 from .. import _api_v2 as ygl
 from .runtime import WORKERS
+from .anonymous_http import AnonymousReads
+from .anonymous_sources import PROFILE_MODULES
 
 
 MAX_REPLY = 6 * 1024 * 1024
@@ -194,7 +196,7 @@ class Module:
             {key: ygl.CapabilityHealth(status) for key in self.handlers().capabilities}
         )
 
-    async def exchange(self, request, *, owner_context=None):
+    async def exchange(self, request, *, owner_context=None, invocation_context=None):
         revision = self.revision
         async with self.io:
             if self.generation is None or revision != self.revision:
@@ -207,7 +209,8 @@ class Module:
                     except (RuntimeError, OSError, EOFError, ValueError) as exc:
                         raise ygl.ServiceUnavailable() from exc
                 # This bit is minted only after binding the live SDK invocation.
-                request = {k: v for k, v in request.items() if k != "owner_action"}
+                request = {k: v for k, v in request.items() if k not in ("owner_action", "anonymous_invocation")}
+                scope = None
                 if owner_context is not None:
                     # Recheck Core's live owner proof after waiting for the worker.
                     scope = await self.services.scopes.bind(owner_context)
@@ -222,6 +225,19 @@ class Module:
                     ):
                         raise ygl.AccessDenied()
                     request = {**request, "owner_action": True}
+                reads = None
+                context = owner_context if owner_context is not None else invocation_context
+                if context is not None and self.key in PROFILE_MODULES:
+                    if (getattr(context, "module_id", None) != PROFILE_MODULES[self.key]
+                            or context.capability_id != request.get("capability_id")):
+                        raise ygl.AccessDenied()
+                    if scope is None:
+                        scope = await self.services.scopes.bind(context)
+                    if scope.invocation is not context:
+                        raise ygl.AccessDenied()
+                    nonce = os.urandom(16).hex()
+                    reads = AnonymousReads(context.module_id, nonce, scope.http)
+                    request["anonymous_invocation"] = nonce
                 encoded = (
                     json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
                 )
@@ -230,10 +246,24 @@ class Module:
                 process = self.process
                 if revision != self.revision or process is None:
                     raise ygl.ServiceUnavailable()
+                deadline = getattr(context, "deadline", None) if reads is not None else None
+                if deadline is not None and deadline <= asyncio.get_running_loop().time():
+                    raise TimeoutError
                 try:
-                    process.stdin.write(encoded)
-                    await process.stdin.drain()
-                    return await read_frame(process)
+                    async with asyncio.timeout_at(deadline):
+                        process.stdin.write(encoded)
+                        await process.stdin.drain()
+                        while True:
+                            reply = await read_frame(process)
+                            if "get" not in reply:
+                                return reply
+                            if reads is None:
+                                raise ValueError("worker read outside bound invocation")
+                            answer = await reads.reply(reply)
+                            if revision != self.revision or process is not self.process:
+                                raise ygl.ServiceUnavailable()
+                            process.stdin.write(json.dumps(answer).encode("ascii") + b"\n")
+                            await process.stdin.drain()
                 except BaseException:
                     # Delivery is indeterminate from the first write. This request
                     # ends here. A fresh interpreter serves subsequent commands.
@@ -570,6 +600,8 @@ class Command:
                 raise ygl.AccessDenied()
             if owner_command:
                 reply = await module.exchange(request, owner_context=context)
+            elif module.key in PROFILE_MODULES:
+                reply = await module.exchange(request, invocation_context=context)
             else:
                 reply = await module.exchange(request)
             if "error" not in reply:
