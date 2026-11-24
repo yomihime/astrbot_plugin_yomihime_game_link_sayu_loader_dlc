@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import hashlib
 from importlib import import_module
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from random import choice
 import sys
 import time
 from typing import Callable
+import uuid
 
 import plugin_bindings
 
@@ -254,6 +256,18 @@ class BaseMysApi:
             return ZZZ_SERVER.get(uid[:2], "prod_gf_jp")
         return "prod_gf_cn"
 
+    def get_device_id(self):
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def get_overseas_device_id(account_id):
+        return str(uuid.uuid3(uuid.NAMESPACE_URL, str(account_id)))
+
+    @classmethod
+    def get_overseas_device_fp(cls, account_id):
+        device_id = cls.get_overseas_device_id(account_id)
+        return hashlib.md5(device_id.encode(), usedforsecurity=False).hexdigest()[:13]
+
     async def get_uid(self, uid, game_name=None):
         models = _owner_models()
         if models is not None:
@@ -319,8 +333,17 @@ class BaseMysApi:
     async def get_user_device_id(self, uid, game_name=None):
         models = _owner_models()
         if models is not None:
-            return await models.GsUser.get_user_attr_by_uid(
-                await self.get_uid(uid, game_name), "device_id", game_name
+            canonical = await self.get_uid(uid, game_name)
+            users = models.GsUser
+            row = await users.select_data_by_uid(canonical, game_name)
+            if row is None:
+                return None
+            if row.device_id is not None:
+                return row.device_id
+            from plugin_account_devices import initialize_device
+
+            return await initialize_device(
+                users, canonical, game_name, self.get_device_id()
             )
         return await GsUser.get_user_attr_by_uid(uid, "device_id", game_name)
 
@@ -360,6 +383,7 @@ class BaseMysApi:
     ):
         game = game_name or "gs"
         account = _account(uid, game)
+        stored = None
         if (
             cookie_type not in ("cookie", "stoken")
             or cookie_mode not in ("RANDOM", "OWNER")
@@ -388,6 +412,7 @@ class BaseMysApi:
                 fp=row.fp,
                 device_info=row.device_info,
             )
+            stored = (row.id, cookie_type, cookie_mode)
         credential = account.stoken if cookie_type == "stoken" else account.cookie
         if not credential or (cookie is not None and cookie != credential):
             return -51
@@ -406,6 +431,7 @@ class BaseMysApi:
                 ds_mode,
                 ds_q,
                 ds_body,
+                stored=stored,
             )
 
     async def simple_mys_req_by_region(
@@ -478,6 +504,34 @@ class BaseMysApi:
             time_out,
         )
 
+    async def _stored_device(self, stored, account, game, credential):
+        models = _owner_models()
+        if models is None:
+            return None
+        row_id, field, mode = stored
+        row = await models.GsUser.select_data_by_uid(account.uid, game)
+        expected = {
+            "id": row_id,
+            field: credential,
+            "fp": account.fp,
+            "device_info": account.device_info,
+        }
+        if row is None or any(getattr(row, k) != v for k, v in expected.items()):
+            return None
+        if mode == "RANDOM":
+            if row.status:
+                return None
+            expected["status"] = row.status
+        if row.fp is None:
+            raise NotImplementedError("account device fingerprint issuer unavailable")
+        if row.device_id is not None:
+            return row.device_id
+        from plugin_account_devices import initialize_device
+
+        return await initialize_device(
+            models.GsUser, account.uid, game, self.get_device_id(), expected=expected
+        )
+
     async def _send_owner(
         self,
         account,
@@ -492,6 +546,8 @@ class BaseMysApi:
         ds_q,
         ds_body,
         timeout=300,
+        *,
+        stored=None,
     ):
         if (
             account is not _account(account.uid, game)
@@ -514,9 +570,9 @@ class BaseMysApi:
         headers = dict(
             self._HEADER_OS if self.check_os(account.uid, game) else self._HEADER
         )
-        if account.device_id:
+        if account.device_id is not None:
             headers["x-rpc-device_id"] = account.device_id
-        if account.fp:
+        if account.fp is not None:
             headers["x-rpc-device_fp"] = account.fp
         if account.device_info is not None:
             device = account.device_info.split("/")
@@ -551,6 +607,14 @@ class BaseMysApi:
         for _ in range(2):
             if account is not _account(account.uid, game):
                 return -51
+            if stored is not None:
+                device = await self._stored_device(stored, account, game, credential)
+                if device is None or any(
+                    k.lower() == "x-rpc-device_id" and v != device
+                    for k, v in (header or {}).items()
+                ):
+                    return -51
+                headers["x-rpc-device_id"] = device
             try:
                 complete_json, raw = await _read_response(
                     url, headers, params, timeout, owner=True

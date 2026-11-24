@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 from contextlib import nullcontext
+import hashlib
+from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
@@ -12,24 +14,98 @@ import tempfile
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 ACTOR = "fixture-actor"
 BOT = "fixture-adapter"
 
 
-async def probe(mode, phase):
-    sys.path.insert(0, str(ROOT / "scripts"))
+async def account_input_probe():
+    from gsuid_core.utils.api.mys.base_request import BaseMysApi
+    from gsuid_core.utils.cookie_manager import add_ck
+
+    cases = [
+        "",
+        "unused=value;login_ticket=transient",
+        "stuid=third;account_id=second;login_uid=first",
+        'login_uid="";account_id=second',
+        'account_id_v2=actor;cookie_token_v2="test=value";ltoken_v2=local',
+        "ltmid_v2=second;mid=first;stoken=test;custom=drop;ltoken=",
+        "stoken_v2=test;cookie_token=sample;login_ticket_v2=drop",
+    ]
+    # Include every public field in one input, independently of the implementation.
+    cases.append(
+        ";".join(
+            f"{key}{suffix}=test{index}"
+            for index, key in enumerate(
+                (
+                    "login_uid",
+                    "account_id",
+                    "stuid",
+                    "ltuid",
+                    "stoken",
+                    "cookie_token",
+                    "login_ticket",
+                    "ltoken",
+                    "account_mid",
+                    "ltmid",
+                    "stmid",
+                )
+            )
+            for suffix in ("", "_v2")
+        )
+        + ";mid=test"
+    )
+    cookies = []
+    for text in cases:
+        parsed = SimpleCookie(text)
+        persist = add_ck.get_persist_cookie_data(parsed)
+        cookies.append(
+            [
+                await add_ck.get_account_id(parsed),
+                add_ck.get_cookie_value(parsed, ["mid", "ltmid_v2"]),
+                list(persist.items()),
+                add_ck.serialize_cookie(persist),
+            ]
+        )
+    regions = []
+    for roles in [
+        (None, None, None),
+        ("1", "7", None),
+        ("6", "1", None),
+        (None, "5", "1234567890"),
+        ("", "6", None),
+        ("", "", "123456789"),
+        ("", None, "1234567890"),
+        ("x", "6", None),
+    ]:
+        try:
+            regions.append(add_ck.is_overseas_account(*roles))
+        except ValueError as exc:
+            regions.append(type(exc).__name__)
+    devices = [
+        (
+            BaseMysApi.get_overseas_device_id(actor),
+            BaseMysApi.get_overseas_device_fp(actor),
+        )
+        for actor in (42, "42", "0042", "", "测试")
+    ]
+    return {"cookies": cookies, "regions": regions, "devices": devices}
+
+
+async def probe(mode, phase, worker):
     from native_contract import offline
 
     sys.addaudithook(offline)
     if mode == "loader":
-        sys.path.insert(0, str(ROOT / "worker"))
-        from plugin_bindings import binding_scope, install
+        sys.path.insert(0, str(worker))
+        from plugin_bindings import binding_scope
+        from plugin_runtime import PluginRuntime
         import sayu_compat
 
         data = Path.cwd() / "data"
         data.mkdir(exist_ok=True)
-        sayu_compat.install("Example", "ex", data)
-        install(sayu_compat.package, data)
+        sayu_compat.install("Example", "ex", data, source_root=Path.cwd())
+        PluginRuntime(data).install(Path.cwd(), "Example")
         scope = binding_scope(ACTOR, BOT, True, writable=True)
     else:
         sys.path.insert(0, str(Path.cwd()))
@@ -42,9 +118,12 @@ async def probe(mode, phase):
         scope = nullcontext()
     from gsuid_core.utils.database.models import GsBind
     from gsuid_core.utils.database.api import get_uid
+    from gsuid_core.utils.cookie_manager.add_ck import get_all_bind_uid
 
     result = {}
     with scope:
+        result["account_input"] = await account_input_probe()
+        result["roles_before"] = await get_all_bind_uid(BOT, ACTOR)
         if phase == "write":
             result["insert"] = [
                 await GsBind.insert_uid(ACTOR, BOT, value, "room", 9)
@@ -53,6 +132,8 @@ async def probe(mode, phase):
             result["sr"] = await GsBind.insert_uid(
                 ACTOR, BOT, "000000003", "room", 9, game_name="sr"
             )
+            for game, uid in (("zzz", "000000005"), ("bbb", "000000006")):
+                await GsBind.insert_uid(ACTOR, BOT, uid, "room", 9, game_name=game)
             result["switch_missing"] = await GsBind.switch_uid_by_game(
                 ACTOR, BOT, "000000004"
             )
@@ -64,6 +145,7 @@ async def probe(mode, phase):
             result["delete_missing"] = await GsBind.delete_uid(ACTOR, BOT, "000000004")
             result["delete"] = await GsBind.delete_uid(ACTOR, BOT, "000000001")
             result["switch_last"] = await GsBind.switch_uid_by_game(ACTOR, BOT)
+        result["roles_after"] = await get_all_bind_uid(BOT, ACTOR)
         result["list"] = await GsBind.get_uid_list_by_game(ACTOR, BOT)
         result["sr_value"] = await GsBind.get_uid_by_game(ACTOR, BOT, "sr")
         result["group"] = (await GsBind.select_data(ACTOR, BOT)).group_id
@@ -94,6 +176,7 @@ async def probe(mode, phase):
                 for operation in (
                     GsBind.get_uid_by_game(ACTOR, BOT),
                     GsBind.delete_uid(ACTOR, BOT, "000000002"),
+                    get_all_bind_uid(BOT, ACTOR),
                 ):
                     try:
                         await operation
@@ -107,17 +190,27 @@ async def probe(mode, phase):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path)
+    parser.add_argument("--worker", type=Path)
+    parser.add_argument("--loader-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--mode", choices=["native", "loader"], help=argparse.SUPPRESS)
     parser.add_argument("--phase", choices=["write", "reopen"], help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.mode:
-        result = asyncio.run(probe(args.mode, args.phase))
+        result = asyncio.run(probe(args.mode, args.phase, args.worker))
     else:
         from native_contract import REFERENCE_COMMIT, copy_reference
 
         result = {"reference": REFERENCE_COMMIT}
         with tempfile.TemporaryDirectory(prefix="sayu-bindings-") as folder:
+            from build_local import worker_archive
+
+            worker = args.worker
+            if worker is None:
+                worker = Path(folder) / "worker.pyz"
+                lock = json.loads((ROOT / "profiles/lock.json").read_bytes())
+                worker.write_bytes(worker_archive(lock["starrail"], offline=True))
+            result["worker_sha256"] = hashlib.sha256(worker.read_bytes()).hexdigest()
             for mode in ["native", "loader"]:
                 work = Path(folder) / mode
                 work.mkdir()
@@ -127,7 +220,7 @@ def main():
                 for phase in ["write", "reopen"]:
                     log = work / (phase + ".json")
                     command = [
-                        sys.executable,
+                        str(args.loader_python.resolve()) if mode == "loader" else sys.executable,
                         "-I",
                         "-B",
                         "-X",
@@ -135,6 +228,8 @@ def main():
                         str(Path(__file__).resolve()),
                         "--mode",
                         mode,
+                        "--worker",
+                        str(worker.resolve()),
                         "--phase",
                         phase,
                         "--output",

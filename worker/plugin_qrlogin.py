@@ -58,7 +58,10 @@ def install_qrlogin(package, data_root):
             else raw
         )
 
-    package("gsuid_core.utils.cookie_manager")
+    package(
+        "gsuid_core.utils.cookie_manager",
+        Path(__file__).parent / "plugin_cookie_manager",
+    )
     package(
         "gsuid_core.utils.cookie_manager.qrlogin"
     ).get_qrcode_base64 = get_qrcode_base64

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from types import ModuleType
+from uuid import UUID
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -210,11 +211,90 @@ async def account_selection(*, native=False):
     await GsUser.update_data_by_uid_without_bot_id(primary, "gs", status=None)
     inactive["restored"] = await cookie(aliases[-1], "gs")
     assert inactive["restored"] == "primary"
+    device_role = "100009007"
+    await GsUser.full_insert_data(
+        **owner, uid=device_role, cookie="fixture-device-owner", device_id=None
+    )
+    await GsUser.full_insert_data(
+        **owner, uid=device_role, cookie="fixture-device-duplicate", device_id="old-value"
+    )
+    first_device = await mys_api.get_user_device_id(device_role, "gs")
+    assert UUID(first_device).version == 4 and str(UUID(first_device)) == first_device
+    assert await mys_api.get_user_device_id(device_role, "gs") == first_device
+    assert (await GsUser.select_data_by_uid(device_role, "gs")).device_id == first_device
+    duplicate = await GsUser.base_select_data(cookie="fixture-device-duplicate")
+    assert duplicate.device_id == first_device
+    await GsUser.update_data_by_uid_without_bot_id(device_role, "gs", device_id="")
+    assert await mys_api.get_user_device_id(device_role, "gs") == ""
+    # Leave a generated value for the separate Loader process that reopens the DB.
+    await GsUser.update_data_by_uid_without_bot_id(device_role, "gs", device_id=None)
+    renewed = await mys_api.get_user_device_id(device_role, "gs")
+    assert UUID(renewed).version == 4 and renewed != first_device
+    missing = await mys_api.get_user_device_id("100009999", "gs")
+    if native:
+        assert UUID(missing).version == 4
+    else:
+        assert missing is None
+    assert await GsUser.select_data_by_uid("100009999", "gs") is None
     return {
-        "same": {"aliases_and_fields": checks, "status": inactive},
+        "same": {
+            "aliases_and_fields": checks,
+            "status": inactive,
+            "device_generated_stored_reused_renewed": True,
+        },
+        "absent_device_row": "transient_uuid" if native else "no_device",
         "unknown_role": unknown,
         "absent_role": absent_role,
     }
+
+
+async def device_rebind(actor):
+    """Pause between the public lookup and its real guarded SQL write."""
+    from unittest.mock import patch
+
+    import plugin_account_devices
+    from gsuid_core.utils.api.mys_api import mys_api
+    from gsuid_core.utils.database.models import GsUser
+
+    initialize = plugin_account_devices.initialize_device
+    for replace in (False, True):
+        role = "100009010" if replace else "100009011"
+        other = "100009012" if replace else "100009013"
+        owner = dict(user_id="actor", bot_id="adapter", cookie="fixture-rebind")
+        observed, resume = asyncio.Event(), asyncio.Event()
+
+        async def interleave(*args):
+            observed.set()
+            await resume.wait()
+            return await initialize(*args)
+
+        async def read():
+            with actor(account_records=True):
+                return await mys_api.get_user_device_id(role, "gs")
+
+        with actor(account_records=True):
+            await GsUser.full_insert_data(uid=role, **owner)
+            original = await GsUser.select_data_by_uid(role, "gs")
+        with patch.object(plugin_account_devices, "initialize_device", interleave):
+            pending = asyncio.create_task(read())
+            try:
+                await asyncio.wait_for(observed.wait(), 5)
+                with actor(account_records=True):
+                    if replace:
+                        await GsUser.delete_row(id=original.id)
+                        await GsUser.full_insert_data(id=original.id, uid=other, **owner)
+                    else:
+                        await GsUser.update_data_by_xx({"id": original.id}, uid=other)
+                    # A new row now owns the requested role.
+                    await GsUser.full_insert_data(uid=role, **owner)
+            finally:
+                resume.set()
+            device = await pending
+        with actor(account_records=True):
+            assert UUID(device).version == 4
+            assert (await GsUser.select_data_by_uid(role, "gs")).device_id == device
+            moved = await GsUser.select_data_by_uid(other, "gs")
+            assert moved.id == original.id and moved.device_id is None
 
 
 async def account_rows(*, native=False):
@@ -240,7 +320,17 @@ async def account_rows(*, native=False):
     )
     await GsUID.full_insert_data(main_uid=uid, uid_1=alias, game_name="gs")
     row = await GsUser.base_select_data(**owner)
-    capture = Capture()
+    class DeviceCapture(Capture):
+        def __init__(self):
+            super().__init__()
+            self.device_headers = []
+
+        def record(self, method, url, headers, params):
+            normalized = {k.lower(): v for k, v in headers.items()}
+            self.device_headers.append(normalized.get("x-rpc-device_id"))
+            super().record(method, url, headers, params)
+
+    capture = DeviceCapture()
     capture.payload = {"retcode": 0, "data": {"current_resin": 129}}
     with ExitStack() as stack:
         if native:
@@ -277,7 +367,43 @@ async def account_rows(*, native=False):
             uid, device_info="fixture/model/os/build"
         )
         external = await query()
-    assert external == capture.payload and len(capture.calls) == 1
+        assert len(capture.calls) == 1
+        await GsUser.update_data_by_uid_without_bot_id(uid, device_id=None)
+        if not native:
+            denied = await mys_api.endpoint_request(
+                DAILY_NOTE, uid, params={"role_id": uid}, ds_mode="none",
+                header={"x-rpc-device_id": "untrusted"},
+            )
+            assert denied == -51
+            import plugin_account_devices
+
+            initialize = plugin_account_devices.initialize_device
+
+            async def rotate(*args, **kwargs):
+                await GsUser.update_data_by_uid_without_bot_id(uid, cookie="fixture-rotated")
+                return await initialize(*args, **kwargs)
+
+            with patch.object(plugin_account_devices, "initialize_device", rotate):
+                assert await query() == -51
+            assert (await GsUser.select_data_by_uid(uid)).device_id is None
+            await GsUser.update_data_by_uid_without_bot_id(uid, cookie=session, fp=None)
+            try:
+                await query()
+            except NotImplementedError as exc:
+                assert "fingerprint" in str(exc)
+            else:
+                raise AssertionError("stored account lacked its fingerprint issuer")
+            assert (await GsUser.select_data_by_uid(uid)).device_id is None
+            assert len(capture.calls) == 1
+            await GsUser.update_data_by_uid_without_bot_id(uid, fp=FP)
+        assert await query() == capture.payload
+        saved_device = (await GsUser.select_data_by_uid(uid)).device_id
+        assert UUID(saved_device).version == 4
+        assert await query() == capture.payload
+        await GsUser.update_data_by_uid_without_bot_id(uid, device_id="")
+        assert await query() == capture.payload
+    assert external == capture.payload and len(capture.calls) == 4
+    assert capture.device_headers == [DEVICE, saved_device, saved_device, ""]
     assert capture.calls[0]["method"] == "GET"
     assert capture.calls[0]["owner_cookie"] and not capture.calls[0]["signed"]
     assert capture.calls[0]["query"] == {"role_id": uid, "server": "cn_gf01"}
@@ -306,6 +432,7 @@ async def account_rows(*, native=False):
     return {
         "model": values,
         "wire": capture.calls[0],
+        "stored_device_header_first_reuse_empty": True,
         "application_headers": application,
         "malformed_device": "IndexError",
         "response": external,
@@ -538,6 +665,22 @@ async def child(kind, source, worker):
                 await mys_api.get_ck("100008001", "OWNER", "gs")
                 == "fixture-cookie-primary"
             )
+            from gsuid_core.utils.database.models import GsUser
+
+            stored = (await GsUser.select_data_by_uid("100009007", "gs")).device_id
+            assert UUID(stored).version == 4
+            assert await mys_api.get_user_device_id("100009007", "gs") == stored
+            await GsUser.update_data_by_uid_without_bot_id(
+                "100009007", "gs", device_id=None
+            )
+
+        async def first_read():
+            with actor(account_records=True):
+                return await mys_api.get_user_device_id("100009007", "gs")
+
+        concurrent = await asyncio.gather(*(first_read() for _ in range(4)))
+        assert len(set(concurrent)) == 1 and UUID(concurrent[0]).version == 4
+        await device_rebind(actor)
         for name, adapter in (("other", "adapter"), ("actor", "other")):
             with actor(name, adapter=adapter, account_records=True):
                 assert await mys_api.get_uid("100008001", "gs") == "100008001"
@@ -550,6 +693,8 @@ async def child(kind, source, worker):
             "persistent_numeric_uid": "000000284",
             "persisted_account_and_alias": True,
             "foreign_actor_and_adapter_isolated": True,
+            "device_persisted_and_concurrent_reads_agreed": True,
+            "rebound_role_and_reused_row_id_isolated": True,
             "migration": first,
         }
     with actor(writable=True):
@@ -775,8 +920,9 @@ def main():
                 for name in zipped.namelist():
                     if name.startswith(prefix):
                         zipped.extract(name, source)
-            archive = work / "worker.pyz"
-            archive.write_bytes(worker_archive(lock))
+            archive = args.worker.resolve() if args.worker else work / "worker.pyz"
+            if args.worker is None:
+                archive.write_bytes(worker_archive(lock))
             runs = {}
             for kind, interpreter in (
                 ("loader", args.loader_python.resolve()),

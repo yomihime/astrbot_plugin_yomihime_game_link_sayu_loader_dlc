@@ -292,12 +292,13 @@ def main():
             work = Path(temp)
             checked = copy_reference(ROOT / ".sayu-local/reference", work / "native")
             (work / "loader").mkdir()
-            worker = work / "worker.pyz"
-            worker.write_bytes(
-                worker_archive(
-                    json.loads((ROOT / "profiles/lock.json").read_bytes())["genshin"]
+            worker = args.worker.resolve() if args.worker else work / "worker.pyz"
+            if args.worker is None:
+                worker.write_bytes(
+                    worker_archive(
+                        json.loads((ROOT / "profiles/lock.json").read_bytes())["genshin"]
+                    )
                 )
-            )
             report = {
                 "reference": REFERENCE_COMMIT,
                 "verified": checked,

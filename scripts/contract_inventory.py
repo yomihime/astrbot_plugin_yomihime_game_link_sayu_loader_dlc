@@ -147,6 +147,8 @@ def proof_index():
             "utils.api.mys.base_request.BaseMysApi.get_uid",
             "utils.api.mys.base_request.BaseMysApi.get_ck",
             "utils.api.mys.base_request.BaseMysApi.get_stoken",
+            "utils.api.mys.base_request.BaseMysApi.get_device_id",
+            "utils.api.mys.base_request.BaseMysApi.get_user_device_id",
         ],
         "image_tools_contract": [
             "utils.image.image_tools." + name
@@ -263,6 +265,15 @@ def proof_index():
         ],
         "binding_contract": [
             "utils.database.api.get_uid",
+            "utils.api.mys.base_request.BaseMysApi.get_overseas_device_id",
+            "utils.api.mys.base_request.BaseMysApi.get_overseas_device_fp",
+            *(
+                "utils.cookie_manager.add_ck." + name
+                for name in (
+                    "get_account_id", "get_cookie_value", "serialize_cookie",
+                    "get_persist_cookie_data", "is_overseas_account", "get_all_bind_uid",
+                )
+            ),
             *(
                 "utils.database.models.GsBind." + method
                 for method in (
@@ -334,7 +345,7 @@ PROBE_LIMITS = {
     "native": "Two generations of the same self-owned test plugin. Unexercised event shapes remain open.",
     "service": "Compared local service gates and priority. Cross-profile management requires host authorization.",
     "sv_routing": "Compared prefix resolution, registration snapshots, registry versions and authorized route settings across two generations. Shared cross-plugin dispatch is native-only.",
-    "binding": "Compared isolated UID lists and mutations. UID registration does not authenticate a game account.",
+    "binding": "Compared isolated UID lists, mutations, Cookie field selection, region precedence and local account-derived IDs. Credential exchange and external authentication remain open.",
     "config": "Compared profile-local configuration loading, types and persistence. Other managers require separate probes.",
     "config_manager": "Compared profile-local config sets, file operations and cache identity. Shared host ACL is separate.",
     "profile_store": "Compared local service switches, priority, deferred writes and migration. Input aliasing and live routing updates differ.",
