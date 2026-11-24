@@ -17,6 +17,10 @@ from plugin_runtime import PluginRuntime
 from plugin_bindings import binding_scope
 from resource_httpx import stream_scope
 from service_settings import management_scope
+from worker_architecture import (
+    configure_worker_architecture,
+    UnsupportedWindowsArchitecture,
+)
 from worker_storage import install_write_guard
 
 
@@ -199,6 +203,18 @@ def main():
     # Keep even imports and native writes to stdout off the protocol stream.
     with os.fdopen(os.dup(sys.stdout.fileno()), "wb") as output:
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        try:
+            configure_worker_architecture()
+        except (OSError, UnsupportedWindowsArchitecture) as exc:
+            report = {
+                "error": "worker_architecture_unavailable",
+                "phase": "startup",
+                "type": type(exc).__name__,
+            }
+            if getattr(exc, "winerror", None) is not None:
+                report["winerror"] = exc.winerror
+            send(output, report)
+            return
         try:
             lock = claim_profile(Path(sys.argv[2]).resolve())
         except (OSError, ProfileBusy) as exc:
