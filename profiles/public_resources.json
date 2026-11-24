@@ -37,6 +37,16 @@
       "https://ww1.loping151.top",
       "https://ww2.loping151.top",
       "https://ww3.loping151.cn"
-    ]
+    ],
+    "platform_indexes": {
+      "declaration": "XutheringWavesUID/XutheringWavesUID/utils/resource/download_all_resource.py",
+      "sha256": "8f5b5f0fffec35e3a90055ef7a7a3cec3ebf9817345d84ecf25c2655d8f74953",
+      "binding": "PLATFORM",
+      "resolver": "get_target_package",
+      "targets": {
+        "win-amd64/cpython-312": "win-x86_64-py3.12",
+        "win-amd64/cpython-313": "win-x86_64-py3.13"
+      }
+    }
   }
 }

@@ -13,6 +13,7 @@ import re
 import ssl
 import subprocess
 import sys
+import sysconfig
 from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
 from urllib.parse import unquote, urlsplit
@@ -146,6 +147,10 @@ def allowed(url, profile):
             return "image", MAX_IMAGE
         if origin in profile.PUBLIC_IMAGE_ORIGINS:
             return "image", MAX_FILE
+    if indexes := getattr(profile, "STATIC_PLATFORM_INDEXES", None):
+        runtime = sysconfig.get_platform() + "/" + sys.implementation.cache_tag
+        if url in indexes.get(runtime, ()):
+            return "exact_index", MAX_INDEX
     for base in (*DEFAULT_MIRRORS, *profile.PUBLIC_BULK_MIRRORS):
         if url == base + "/":
             return "index", MAX_INDEX
@@ -181,9 +186,12 @@ def fetch(url, limit, profile, deadline=None):
     status, raw_headers, data = read_public_https(
         url,
         min(limit, ceiling),
-        accept={"image": "image/*", "index": "text/html", "json": "application/json"}[
-            kind
-        ],
+        accept={
+            "image": "image/*",
+            "index": "text/html",
+            "exact_index": "text/html",
+            "json": "application/json",
+        }[kind],
         skip_error_body=True,
         **error_policy,
         **timing,
@@ -219,6 +227,18 @@ def fetch(url, limit, profile, deadline=None):
     elif kind == "json":
         mime = "application/json"
         json.loads(data)
+    elif kind == "exact_index":
+        from plugin_resource_mirror import _Index
+
+        mime = "text/html"
+        page = _Index()
+        page.feed(data.decode("utf8"))
+        page.close()
+        title = f"<title>Index of {urlsplit(url).path}</title>".encode("ascii")
+        if not (
+            title in data and page.listing and page.done and len(page.entries) <= 1024
+        ):
+            raise Unsupported("invalid static directory index")
     else:
         mime = "text/html"
         if b"Index of /" not in data and b"<pre" not in data.lower():

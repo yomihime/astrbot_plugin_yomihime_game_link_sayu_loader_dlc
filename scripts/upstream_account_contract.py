@@ -327,6 +327,13 @@ def install_loader_io(stack, work):
     import resource_broker
     from worker_storage import install_offline_guard, install_write_guard
 
+    # This in-process runner enters the real worker lifecycle below main().
+    # Archived candidates predating the OS bootstrap had no such step.
+    with ZipFile(archive) as sealed:
+        if "worker_architecture.py" in sealed.namelist():
+            from worker_architecture import configure_worker_architecture
+
+            configure_worker_architecture()
     if getattr(game_profile, "PUBLIC_RESOURCES_ONLY", False):
         from resource_httpx import static_httpx
 
@@ -1010,6 +1017,11 @@ def main():
                 for k, v in os.environ.items()
                 if k.upper() in ("SYSTEMROOT", "WINDIR", "LANG", "PATH")
             }
+            if args.mode == "native" and os.name == "nt":
+                for name in ("PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432"):
+                    value = os.environ.get(name)
+                    if value in ("AMD64", "x86", "ARM64", "ARM"):
+                        env[name] = value
             env.update(
                 {
                     k: str(home)

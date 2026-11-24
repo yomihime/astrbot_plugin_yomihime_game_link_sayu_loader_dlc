@@ -150,7 +150,58 @@ def _stream_objects(body, declaration, mirrors, package):
         yield url, declaration["mime"], declaration["bytes"]
 
 
-def from_snapshot(path, lock, *, stream_objects=None, policy=None):
+def _platform_binding(tree, body, spec):
+    if sha256(body).hexdigest() != spec["sha256"]:
+        raise ValueError("platform directory declaration changed")
+    assignments = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == spec["binding"]
+            for target in node.targets
+        )
+    ]
+    if not (
+        len(assignments) == 1
+        and isinstance(call := assignments[0], ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == spec["resolver"]
+        and not (call.args or call.keywords)
+        and any(
+            isinstance(fn, ast.FunctionDef) and fn.name == spec["resolver"]
+            for fn in tree.body
+        )
+    ):
+        raise ValueError("missing pinned platform resolver")
+
+
+def _collect_platform_indexes(keys, spec, origins, package, indexes):
+    for key in keys:
+        if not isinstance(key, ast.JoinedStr) or not any(
+            isinstance(part, ast.FormattedValue) for part in key.values
+        ):
+            continue
+        for target, platform in spec["targets"].items():
+            path = _constant_string(key, {spec["binding"]: platform})
+            # Require the platform to occupy a complete path component. Static
+            # literals elsewhere in the route stay subject to the normal grammar.
+            if not path or path.split("/").count(platform) != 1:
+                continue
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+(?:\.[0-9]+)?", platform):
+                raise ValueError("invalid platform directory")
+            if not DIRECTORY.fullmatch(
+                "/".join("platform" if p == platform else p for p in path.split("/"))
+            ):
+                raise ValueError("invalid platform resource index")
+            indexes.setdefault(target, set()).update(
+                f"{origin}/{package}/{path}/" for origin in origins
+            )
+
+
+def from_snapshot(
+    path, lock, *, stream_objects=None, platform_indexes=None, policy=None
+):
     images, directories = set(), set()
     with path.open("rb") as stream:
         if file_digest(stream, "sha256").hexdigest() != lock["snapshot_sha256"]:
@@ -175,6 +226,13 @@ def from_snapshot(path, lock, *, stream_objects=None, policy=None):
                 if b"https://" not in body and b"download_all_file" not in body:
                     continue
                 tree = ast.parse(body)
+                platform_spec = (policy or {}).get("platform_indexes", {})
+                platform_source = (
+                    platform_indexes is not None
+                    and name == platform_spec.get("declaration")
+                )
+                if platform_source:
+                    _platform_binding(tree, body, platform_spec)
                 images.update(_static_table_images(tree))
                 fragments = {
                     id(value)
@@ -220,6 +278,14 @@ def from_snapshot(path, lock, *, stream_objects=None, policy=None):
                             continue
                         for value in _values(fn, call.args[1]):
                             if isinstance(value, ast.Dict):
+                                if platform_source:
+                                    _collect_platform_indexes(
+                                        value.keys,
+                                        platform_spec,
+                                        policy["bulk_mirrors"],
+                                        lock["package"],
+                                        platform_indexes,
+                                    )
                                 directories.update(
                                     key.value
                                     for key in value.keys
@@ -231,4 +297,11 @@ def from_snapshot(path, lock, *, stream_objects=None, policy=None):
         policy["bulk_mirrors"]
     ):
         raise ValueError("incomplete source declaration for static stream")
+    if platform_indexes is not None and (
+        spec := (policy or {}).get("platform_indexes")
+    ):
+        if set(platform_indexes) != set(spec["targets"]):
+            raise ValueError(
+                "incomplete source declaration for platform resource indexes"
+            )
     return sorted(images), sorted(directories)
