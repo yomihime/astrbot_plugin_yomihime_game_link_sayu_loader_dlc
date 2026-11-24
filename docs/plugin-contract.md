@@ -31,6 +31,19 @@
 | 已确认的只读 GET 连接失败、无效 JSON 和消息顺序 | 两端都经真实 `GsUser.insert_data` 写合成记录，并使用 `ds_mode="none"`。`scripts/mys_read_error_contract.py` 执行带 Bot 的回调，核对首次通知、再次请求、两次失败返回 `-999`、随后恢复及无 Bot 时的异常 | 取消、权限拒绝、响应超限与结果不明时不重放。空白正文在原生默认日志处理引发 `KeyError`，Loader 返回 `ValueError`。完整 JSON 字面值 `null` 在原生同样为日志 `KeyError`，Loader 在结果解析时报 `TypeError`。这两类差异均有单独断言 |
 | Worker 取消与重载 | `tests/test_module_worker_recovery.py` 经真实子进程管道区分发送前取消、开始写入后结果不明及停用，核对下一次调用和 Windows 子进程退出 | 测试覆盖确定的挂起和退役时序；没有穷举任意插件的后台任务 |
 
+### 三个固定插件的账号调用点
+
+下列入口取自固定提交。相同输入下的原生与 Loader 运行记录由 `scripts/upstream_account_contract.py` 生成。
+
+| 原版插件 | 入口 | 实际调用与核对范围 |
+| --- | --- | --- |
+| StarRailUID 0.2.0 | 绑定与解绑（同一回调） | `send_link_uid_msg` 调用 `GsBind.insert_uid`、`delete_uid`，按事件提供用户、适配器、群及游戏。重复绑定和两个发送者的结果已作双端对照。 [固定源码](https://github.com/baiqwerdvd/StarRailUID/blob/739a80a26b7a137b6b7b7d45435c769822de06d0/StarRailUID/starrailuid_user/__init__.py#L47) |
+| StarRailUID 0.2.0 | 已绑定账号的状态查询 | 先从 `GsBind.get_uid_list_by_game` 读取当前账号，再用 `GsUser.get_user_cookie_by_uid` 取凭据。读取绑定已核对；合成会话的完整状态查询仍在受信请求证明处停止。 [固定源码](https://github.com/baiqwerdvd/StarRailUID/blob/739a80a26b7a137b6b7b7d45435c769822de06d0/StarRailUID/starrailuid_stamina/draw_stamina_card.py#L111) |
+| GenshinUID 6.4.0 | UID 管理 | `send_link_uid_msg` 使用原生的绑定、切换和删除接口。当前用户的重复、解绑和持久化均在冻结 worker 的真实回调中核对。 [固定源码](https://github.com/KimigaiiWuyi/GenshinUID/blob/319b13465a60f96a2db2d5d569ca6a15128a9f2f/GenshinUID/genshinuid_user/__init__.py#L44) |
+| GenshinUID 6.4.0 | 树脂查询 | 原包从绑定行取 UID 列表。测试向两端提供相同的个人记录与受控角色响应，原生有树脂结果，Loader 的签发边界明确拒绝。 [固定源码](https://github.com/KimigaiiWuyi/GenshinUID/blob/319b13465a60f96a2db2d5d569ca6a15128a9f2f/GenshinUID/genshinuid_resin/draw_resin_card.py#L101) |
+| XutheringWavesUID 3.8.1 | 会话录入及刷新 | `add_cookie` 根据外部角色列表调用 `WavesUser` 的查找、插入或更新，并更新 `WavesBind`。同一文件的刷新路径调用 `WavesUser.select_data_list`。外部角色服务在账号契约测试中使用受控响应，两种游戏角色和两个独立用户的实际 SQLite 行均可检查。 [固定源码](https://github.com/Loping151/XutheringWavesUID/blob/7248f8cda8aa3164aca560e145e306a829e3c49d/XutheringWavesUID/wutheringwaves_user/deal.py#L161) |
+| XutheringWavesUID 3.8.1 | 凭据删除 | 原包调用 `WavesUser.delete_cookie`，传入 UID、发送者、适配器及游戏 ID。返回正文和删除后数据库均纳入账号对照。 [固定源码](https://github.com/Loping151/XutheringWavesUID/blob/7248f8cda8aa3164aca560e145e306a829e3c49d/XutheringWavesUID/wutheringwaves_user/deal.py#L252) |
+
 插件 ORM 的个人显示偏好端口按当前 profile 的清单授权。只有声明为 `write`、隐私下限为 `owner` 的能力，才能在当前投递任务中写入当前用户和适配器的独立 SQLite 文件。端口接受插件自己直接声明的 `BaseIDModel`，要求整数主键 `id`、唯一文本 `user_id`，其余列只能是表示界面语言的文本 `lang`、`language` 或 `locale`。其他用户设置、群组或账户字段需要独立的数据域或明确的结构授权。测试使用原样的鸣潮语言模型及另一插件的 `ReaderSettings.locale`。
 
 插件自有的 `Bind` 子类可以用同一次私有投递获得的数字 UID 授权，读写当前用户与适配器在原表中的绑定。表须具备原生身份列，其余列仅接受 `uid` 和 `<游戏>_uid`，每个 UID 由 1 至 32 位 ASCII 数字组成，前导零与列表顺序均保留。旧绑定的群关联只能原样保留。带凭据列、额外业务列或与声明不符的实际表结构需要独立授权。`scripts/orm_contract.py` 对照了上游鸣潮的首次绑定、重复、切换、删除和跨代重开，也覆盖另一插件自定义的 `ebook_uid`。
